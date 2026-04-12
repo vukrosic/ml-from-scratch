@@ -197,6 +197,4 @@ Every gradient should match PyTorch to 1e-6 tolerance. If you see a `FAIL`, the 
 
 ---
 
-## Get the extended notebook with Jacobian derivation, PyTorch hook system internals, custom autograd Functions, and profiling across batch sizes:
-
-**https://www.skool.com/opensuperintelligencelab**
+Get the video walkthrough of Jacobian derivation, PyTorch hook system internals, custom autograd Functions, and profiling: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

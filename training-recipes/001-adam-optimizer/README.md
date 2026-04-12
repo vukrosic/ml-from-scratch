@@ -174,4 +174,4 @@ A well-tuned Adam typically sits in the `1e-4` to `1e-3` range. The loss landsca
 
 ---
 
-**Get the extended notebook with AdamW (decoupled weight decay), LAMB optimizer, Sophia optimizer, adaptive optimizers for large batch training, and LR scheduling best practices:** https://www.skool.com/opensuperintelligencelab
+Get the video walkthrough of AdamW, LAMB optimizer, Sophia optimizer, large batch training, and LR scheduling best practices: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

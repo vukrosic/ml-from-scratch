@@ -241,6 +241,4 @@ print(f"Graphs:       {explanation.graph_count}")
 - The first call always compiles -- warm up before timing
 - `.item()` in a forward pass causes graph breaks -- use `torch.where` instead
 
-## CTA
-
-Get the extended notebook with profiling across 5 architectures, an annotated Triton kernel walkthrough, and an automated graph break scanner: [Skool $49](https://www.skool.com/opensuperintelligencelab)
+Get the video walkthrough of profiling across 5 architectures, annotated Triton kernel output, and the automated graph break scanner: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

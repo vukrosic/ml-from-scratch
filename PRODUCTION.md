@@ -2,24 +2,25 @@
 
 ## Per-lesson checklist
 
-1. **Code** — write all `.py` files in the lesson folder
+1. **Code** — write all `.py` files in the lesson folder (core + extended)
 2. **README** — write the article (same text goes to blog)
 3. **Blog** — copy to `/root/opensuperintelligencelab/src/content/{slug}.mdx`
-4. **Skool $49** — extended notebook/scripts (NOT in this repo)
-5. **Record** — screen-record scrolling through blog article
-6. **Upload** — YouTube with description linking to this repo's lesson folder
-7. **Post** — X + LinkedIn with key insight from the lesson
+4. **Record free video** — screen-record scrolling through blog article (core content)
+5. **Record Skool video** — walkthrough of the extended code files (paid)
+6. **Upload YouTube** — free video with description linking to this repo's lesson folder
+7. **Upload Skool** — extended video walkthrough ($49)
+8. **Post** — X + LinkedIn with key insight from the lesson
 
 ## YouTube description template
 
 ```
 {title} — ML From Scratch
 
-Code: https://github.com/vukrosic/ml-from-scratch/tree/main/{series}/{lesson}/
+All code (free): https://github.com/vukrosic/ml-from-scratch/tree/main/{series}/{lesson}/
 Blog: https://vukrosic.vercel.app/blog/{slug}/
-Extended materials: https://www.skool.com/opensuperintelligencelab
+Extended video walkthroughs: https://www.skool.com/opensuperintelligencelab
 
-All code is free and open source.
+All code is free and open source forever.
 ```
 
 ## Naming conventions

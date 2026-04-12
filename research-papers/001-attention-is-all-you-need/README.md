@@ -291,5 +291,4 @@ python evaluate.py
 
 ---
 
-Get the extended notebook with ablation studies, attention weight visualisations, annotated paper equations, RoPE vs sinusoidal comparison, and hyperparameter scaling plots:
-**https://www.skool.com/opensuperintelligencelab**
+Get the video walkthrough of ablation studies, attention weight visualisations, RoPE vs sinusoidal comparison, and hyperparameter scaling: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

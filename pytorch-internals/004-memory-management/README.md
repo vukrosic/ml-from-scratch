@@ -162,4 +162,4 @@ See the full file: [`snapshot.py`](snapshot.py)
 
 ---
 
-Get the extended notebook with CUDA caching allocator internals, fragmentation analysis across batch sizes, memory leak detection, and OOM debugging playbook: [https://www.skool.com/opensuperintelligencelab](https://www.skool.com/opensuperintelligencelab)
+Get the video walkthrough of CUDA caching allocator internals, fragmentation analysis, memory leak detection, and OOM debugging: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

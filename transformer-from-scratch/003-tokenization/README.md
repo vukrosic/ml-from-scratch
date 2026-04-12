@@ -263,4 +263,4 @@ Our toy implementation is much faster because it does less — no REST calls, no
 - Encoding: start with characters, apply each learned merge in order
 - The vocabulary size (number of merges) trades off between coverage and sequence length
 
-## Get the extended notebook with tokenizer edge cases, subword regularization, and a full comparison of SentencePiece vs BPE vs WordPiece: [Skool $49](https://www.skool.com/opensuperintelligencelab)
+Get the video walkthrough of tokenizer edge cases, subword regularization, and SentencePiece vs BPE vs WordPiece comparison: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

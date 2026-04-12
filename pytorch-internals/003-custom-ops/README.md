@@ -146,4 +146,4 @@ The custom op is slower due to Python call overhead. The real value of custom op
 
 ---
 
-Get the extended notebook with graph break diagnostics, custom CUDA kernel registration, and profiling across 5 model architectures: [Open Superintelligence Lab on Skool](https://www.skool.com/opensuperintelligencelab)
+Get the video walkthrough of graph break diagnostics, custom CUDA kernel registration, and profiling across 5 architectures: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

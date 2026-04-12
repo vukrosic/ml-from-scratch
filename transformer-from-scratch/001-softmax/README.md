@@ -98,4 +98,4 @@ Pure Python is intentionally slow. The point of this lesson is not speed — it 
 
 ---
 
-Get the extended notebook with log-softmax derivation, Gumbel-softmax, dtype numerical comparison across 5 types, temperature scaling entropy plots, and attention weight visualisation with real sentence embeddings: [OpenSuperintelligenceLab on Skool →](https://www.skool.com/opensuperintelligencelab)
+Get the video walkthrough of log-softmax derivation, Gumbel-softmax, dtype numerical comparison, temperature scaling entropy plots, and attention weight visualisation: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

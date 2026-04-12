@@ -188,6 +188,4 @@ The output shows forward pass latency across several batch/sequence/model-size c
 
 ---
 
-## Get the extended notebook with multi-head attention internals, grouped-query attention (GQA), flash attention intuition, and attention pattern analysis across real transformer layers:
-
-**https://www.skool.com/opensuperintelligencelab**
+Get the video walkthrough of multi-head attention internals, grouped-query attention (GQA), flash attention intuition, and attention pattern analysis: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

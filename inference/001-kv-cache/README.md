@@ -112,4 +112,4 @@ Understanding the KV-cache also clarifies why techniques like prefix caching and
 
 ---
 
-**Get the extended notebook with multi-head vs grouped-query attention, PagedAttention internals, and cache eviction strategies:** [https://www.skool.com/opensuperintelligencelab](https://www.skool.com/opensuperintelligencelab)
+Get the video walkthrough of multi-head vs grouped-query attention, PagedAttention internals, and cache eviction strategies: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)
