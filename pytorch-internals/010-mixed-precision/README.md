@@ -107,12 +107,20 @@ scaler = GradScaler()
 for inputs, targets in dataloader:
     inputs, targets = inputs.cuda(), targets.cuda()
 
+    # autocast: ops like matmul run in FP16/BF16 automatically
     with autocast():
         outputs = model(inputs)
         loss = loss_fn(outputs, targets)
 
+    # scale(loss): multiply loss by scale factor before backward
+    # this makes gradients larger, keeping them in representable FP16 range
     scaler.scale(loss).backward()
+
+    # step unscales gradients before optimizer update (recovers true gradient values)
     scaler.step(optimizer)
+
+    # update: adjust scale factor for next iteration
+    # grows if no overflow occurred, shrinks if overflow was detected
     scaler.update()
 ```
 
@@ -206,11 +214,11 @@ for inputs, targets in dataloader:
 
 ## Recap
 
-- **FP16 halves memory, BF16 is safer.** Both use 2 bytes vs 4 for FP32.
+- **FP16 halves memory, BF16 is safer.** Both use 2 bytes vs 4 for FP32. A 1B parameter model: ~4 GB in FP32, ~1 GB per precision in FP16/BF16.
 - **BF16 has a larger exponent.** It rarely underflows — better for deep networks.
 - **Autocast patches ops.** Wrap `forward()` with `autocast()` and supported ops run in lower precision.
 - **GradScaler fixes underflow.** Scale the loss up, unscale gradients before optimizer step.
-- **TF32 on Ampere+ is free speed.** Set `torch.set_float32_matmul_precision("high")`.
+- **TF32 on Ampere+ is free speed.** Set `torch.set_float32_matmul_precision("high")`. Matmuls typically run ~2-3x faster with TF32 vs FP32 on Ampere+ GPUs.
 - **Measure first.** Run the benchmark scripts to see if mixed precision helps your workload.
 
 ---

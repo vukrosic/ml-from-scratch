@@ -160,17 +160,23 @@ print(result.sum())
 CUDA events record a point in a stream. You can measure elapsed time between two events, or use them as explicit synchronization points.
 
 ```python
+# Create two events: start and end markers
 start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 
+# Record start event in the stream (captures current stream position)
 start_event.record()
 
 with torch.cuda.stream(stream):
     result = x @ y
 
+# Record end event after the kernel
 end_event.record()
+
+# Block CPU until the kernel completes so we get accurate timing
 stream.synchronize()
 
+# elapsed_time uses GPU hardware timers — accurate GPU time, not CPU time
 elapsed_ms = start_event.elapsed_time(end_event)
 print(f"Kernel took {elapsed_ms:.2f} ms")
 ```
@@ -228,28 +234,30 @@ The compute and transfer streams run concurrently. The CPU prepares the next bat
 
 ```python
 def overlapped_pipeline(data_loader, model):
+    # Dedicated stream for data transfer (separate from compute)
     transfer_stream = torch.cuda.Stream()
 
-    # Pre-transfer first batch
+    # Pre-transfer first batch so compute stream has immediate work
     batch = next(iter(data_loader))
     input_batch = batch['input'].to('cuda')
 
     for batch in data_loader:
+        # New compute stream each iteration — avoids stream ordering issues
         compute_stream = torch.cuda.Stream()
 
-        # Compute on current batch
+        # Launch compute on current batch (runs on compute_stream)
         with torch.cuda.stream(compute_stream):
             result = model(input_batch)
 
-        # Transfer next batch on transfer stream
+        # Launch transfer of next batch (runs on transfer_stream concurrently)
         with torch.cuda.stream(transfer_stream):
             next_input = batch['input'].to('cuda')
 
-        # Synchronize before using next batch
+        # Wait for compute to finish before yielding result
         result.synchronize()
         yield result
 
-        # Advance
+        # Advance: next batch becomes current batch
         input_batch = next_input
 ```
 

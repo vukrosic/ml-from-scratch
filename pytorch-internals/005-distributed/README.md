@@ -293,7 +293,7 @@ PyTorch also has `DataParallel` (DP). It is simpler but slower:
 | Multi-GPU | All GPUs compute | One GPU coordinates |
 | Multi-node | Works | Does not work |
 
-DDP communicates less, uses memory more efficiently, and scales to multiple nodes. Always prefer DDP.
+DDP communicates less, uses memory more efficiently, and scales to multiple nodes. With NCCL on two GPUs, DDP typically achieves ~1.8x speedup vs single GPU for compute-bound workloads. Always prefer DDP.
 
 ---
 
@@ -304,7 +304,7 @@ DDP communicates less, uses memory more efficiently, and scales to multiple node
 - **Collective ops:** `all_reduce` sums across ranks (gradient sync), `all_gather` collects tensors, `broadcast` distributes from root, `reduce` aggregates to root, `barrier` synchronizes.
 - **DDP:** Every rank has a full model copy. After backward, gradients are all_reduced so all ranks have identical averaged gradients before the optimizer step.
 - **torchrun:** Launches processes, sets environment variables, handles cleanup. Use `--nproc_per_node` to control GPU count.
-- **Scaling:** DDP scales near-linearly for compute-bound workloads. Small models or slow interconnects bottleneck on communication.
+- **Scaling:** DDP scales near-linearly (~Nx speedup on N GPUs) for compute-bound workloads. Small models or slow interconnects bottleneck on communication.
 
 ---
 

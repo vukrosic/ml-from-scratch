@@ -38,13 +38,16 @@ The effect: momentum dampens oscillations in one direction while reinforcing con
 ```python
 def sgd_momentum(params, grads, velocities, lr=1e-3, momentum=0.9):
     for p, g, v in zip(params, grads, velocities):
-        v.data = momentum * v + g      # accumulate velocity
-        p.data = p - lr * v            # update using velocity
+        # Accumulate velocity: v = momentum * v + gradient
+        # This builds up inertia in consistent directions
+        v.data = momentum * v + g
+        # Update: p = p - lr * velocity (not raw gradient)
+        p.data = p - lr * v
 ```
 
 Velocities must be initialized to zeros. They persist across steps — that is the memory of where you have been.
 
-### One layer as a complete example
+### Piece 1: Complete SGD with momentum example
 
 ```python
 import torch
@@ -52,15 +55,15 @@ import torch
 # Simple 2D problem: minimize (w - target)^2
 target = 5.0
 w = torch.tensor([0.0], requires_grad=True)
-optimizer = torch.optim.SGD([w], lr=0.1, momentum=0.9)
 
-velocity = torch.zeros_like(w)  # track velocity explicitly
+# Velocity persists across steps — initialize to zero
+velocity = torch.zeros_like(w)
 
 for step in range(100):
     loss = (w - target) ** 2
     loss.backward()
 
-    # Manual momentum update
+    # Manual momentum update: v = momentum * v + grad
     with torch.no_grad():
         velocity = 0.9 * velocity + w.grad
         w = w - 0.1 * velocity
@@ -108,16 +111,20 @@ Bias correction divides by `(1 - beta^t)` where `t` is the step number. At step 
 ```python
 def adam(params, grads, m, v, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
     for t, (p, g) in enumerate(zip(params, grads), 1):
+        # Update biased first moment estimate: m = beta1 * m + (1-beta1) * g
         m.data = beta1 * m + (1 - beta1) * g
+        # Update biased second moment estimate: v = beta2 * v + (1-beta2) * g^2
         v.data = beta2 * v + (1 - beta2) * g * g
 
+        # Bias-correct both estimates: divide by (1 - beta^t)
         m_hat = m / (1 - beta1 ** t)
         v_hat = v / (1 - beta2 ** t)
 
+        # Update parameters: p = p - lr * m_hat / (sqrt(v_hat) + eps)
         p.data = p - lr * m_hat / (v_hat.sqrt() + eps)
 ```
 
-### One layer as a complete example
+### Piece 1: Complete Adam example on one parameter
 
 ```python
 import torch
@@ -125,7 +132,7 @@ import torch
 target = 5.0
 w = torch.tensor([0.0], requires_grad=True)
 
-# Adam state: first and second moments
+# Adam state: first and second moments (initialized to zero)
 m = torch.zeros_like(w)
 v = torch.zeros_like(w)
 
@@ -135,12 +142,14 @@ for step in range(100):
 
     g = w.grad
 
-    # Adam update with bias correction
+    # Bias-corrected first moment (direction)
     m = 0.9 * m + 0.1 * g
-    v = 0.999 * v + 0.001 * g * g
     m_hat = m / (1 - 0.9 ** (step + 1))
+    # Bias-corrected second moment (scale)
+    v = 0.999 * v + 0.001 * g * g
     v_hat = v / (1 - 0.999 ** (step + 1))
 
+    # Update: divide lr by RMS of second moment
     w.data = w - 0.1 * m_hat / (v_hat.sqrt() + 1e-8)
 
     print(f"Step {step}: w = {w.item():.4f}, loss = {loss.item():.4f}")
@@ -192,18 +201,20 @@ AdamW decouples the two, so the decay is uniform across all parameters.
 ```python
 def adamw(params, grads, m, v, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01):
     for t, (p, g) in enumerate(zip(params, grads), 1):
+        # Same bias-corrected moment estimates as Adam
         m.data = beta1 * m + (1 - beta1) * g
         v.data = beta2 * v + (1 - beta2) * g * g
 
         m_hat = m / (1 - beta1 ** t)
         v_hat = v / (1 - beta2 ** t)
 
-        # Decoupled weight decay: applied directly to parameters
+        # Adam update with adaptive lr
         p.data = p - lr * m_hat / (v_hat.sqrt() + eps)
+        # Decoupled weight decay: applied directly to parameters, independent of gradient
         p.data = p - lr * weight_decay * p
 ```
 
-### One layer as a complete example
+### Piece 1: Complete AdamW example
 
 ```python
 import torch
@@ -220,13 +231,15 @@ for step in range(100):
 
     g = w.grad
 
+    # Bias-corrected first and second moments
     m = 0.9 * m + 0.1 * g
     v = 0.999 * v + 0.001 * g * g
     m_hat = m / (1 - 0.9 ** (step + 1))
     v_hat = v / (1 - 0.999 ** (step + 1))
 
+    # Adam step with decoupled weight decay
     w.data = w - 0.1 * m_hat / (v_hat.sqrt() + 1e-8)
-    w.data = w - 0.1 * 0.01 * w  # decoupled weight decay
+    w.data = w - 0.1 * 0.01 * w  # separate decay step, not added to gradient
 
     print(f"Step {step}: w = {w.item():.4f}, loss = {loss.item():.4f}")
 ```

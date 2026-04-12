@@ -1,6 +1,6 @@
-# 008: DataLoader From Scratch
+# DataLoader From Scratch
 
-**Hook:** You need to feed data to your model efficiently—DataLoader is the pipe, and understanding its internals lets you avoid the bottlenecks that slow training.
+You need to feed data to your model efficiently. DataLoader is the pipe, and understanding its internals lets you avoid the bottlenecks that slow training.
 
 ---
 
@@ -545,7 +545,7 @@ loader = DataLoader(
 
 ---
 
-## Checklist
+## Recap
 
 - Map-style `Dataset` uses `__len__` and `__getitem__`; iterable-style uses `__iter__`
 - Samplers control index order; built-ins handle sequential, random, and weighted sampling
@@ -554,3 +554,9 @@ loader = DataLoader(
 - `pin_memory=True` enables DMA for faster CPU-to-GPU transfers
 - `prefetch_factor` controls how many batches each worker prefetches
 - Each worker holds its own Dataset copy—keep datasets small to avoid memory bloat
+
+---
+
+## Going Further
+
+For real benchmark numbers across num_workers values, pin_memory speedup measurements, prefetch_factor scaling, and memory profiling of worker processes — see [ADVANCED.md](./ADVANCED.md).
