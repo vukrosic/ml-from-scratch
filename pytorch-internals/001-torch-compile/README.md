@@ -6,11 +6,58 @@ One line of code turns your PyTorch model into a fused GPU kernel — and it run
 
 ## What Problem torch.compile Solves
 
-Every time you call `model(x)` in PyTorch, Python sends one operation at a time to the GPU. Linear layer runs. GPU waits. ReLU runs. GPU waits. Loss computes. GPU waits. Each dispatch has overhead, and the GPU sits idle between operations.
+### The Problem: Idle GPU Time
 
-`torch.compile` solves this by converting your entire model — forward and backward pass — into a single optimized GPU kernel. The operations fuse: linear and ReLU become one kernel that runs without memory round-trips. PyTorch's own benchmark on a 4096×4096 matrix shows a median 2.5× speedup after compilation (https://pytorch.org/tutorials/intermediate/torch_compile_tutorial.html).
+Every time you call `model(x)` in PyTorch, Python dispatches operations one at a time:
 
-The catch: compilation has a one-time cost, and certain code patterns prevent fusion. Understanding the three-stage pipeline below tells you exactly why.
+```python
+x = self.linear1(x)   # Python → GPU: linear1 kernel launches
+x = torch.relu(x)     # Python → GPU: ReLU kernel launches
+x = self.linear2(x)   # Python → GPU: linear2 kernel launches
+```
+
+What the GPU actually sees:
+
+```
+GPU timeline:
+|  linear1 kernel  |  idle  |  ReLU kernel  |  idle  |  linear2 kernel  |
+|<---- ~X ms ---->|<-gap-->|<---- ~Y ms --->|<-gap-->|<----- ~Z ms ---->|
+```
+
+Each gap is dead time. The GPU finished one kernel and sat idle waiting for Python to send the next message. For a model with 100 layers, those 99 gaps compound.
+
+### The Fix: Fuse Everything Into One Kernel
+
+`torch.compile` takes the full sequence and fuses it into a single GPU kernel:
+
+```
+GPU timeline (compiled):
+|           one fused kernel (linear1 + ReLU + linear2)            |
+|<---------------------- ~X ms total ---------------------------->|
+```
+
+The GPU runs the whole thing without stopping. No gaps. No round-trips to memory between operations.
+
+PyTorch's own benchmark on a 4096×4096 matrix shows a median 2.5× speedup after compilation (https://pytorch.org/tutorials/intermediate/torch_compile_tutorial.html). Run `benchmark.py` to see your speedup — expect roughly ~2-3x on steady-state runs.
+
+### The Catch: Compilation Is Not Free
+
+The first call is always slow — TorchDynamo has to trace your model, AOT Autograd has to capture the backward pass, and TorchInductor has to generate and compile a Triton kernel. This can take several seconds depending on model size.
+
+```
+Call 1:  |______________compilation_____________|  run once
+Call 2:  |---fast---|---fast---|---fast---|      cached
+Call 3:  |---fast---|---fast---|---fast---|      cached
+...
+```
+
+After that, every call is fast. The compilation cost pays for itself over hundreds of training steps.
+
+### The Other Catch: Graph Breaks Fragment the Graph
+
+If TorchDynamo encounters something it cannot compile — like `if x.sum() > 0` — it splits the graph. Fusion cannot span the break. You end up with two smaller kernels instead of one big one, and the performance gains evaporate.
+
+Every break is a lost fusion opportunity. Understanding why breaks happen (and how to fix them) is the rest of this article.
 
 ---
 
@@ -22,7 +69,15 @@ The catch: compilation has a one-time cost, and certain code patterns prevent fu
 
 Dynamo hooks into Python's bytecode interpreter. As your model runs, it records each operation into an FX graph — a list of ops with inputs and outputs.
 
-When Dynamo encounters something it cannot compile — a data-dependent `if tensor.sum() > 0` — it ends the current graph, runs that piece in normal Python, then starts a new graph. Each gap is a **graph break**.
+What Dynamo produces:
+
+```
+('t3', 'matmul', ['x', 'w1'])
+('t4', 'relu',   ['t3'])
+('t5', 'matmul', ['t4', 'w2'])
+```
+
+Each tuple is `(output_name, operation, input_names)`. When Dynamo encounters something it cannot compile — a data-dependent `if tensor.sum() > 0` — it ends the current graph, runs that piece in normal Python, then starts a new graph. Each gap is a **graph break**.
 
 Dynamo is correct first. If it cannot trace something, it breaks rather than silently producing wrong results. (https://pytorch.org/tutorials/intermediate/torch_compile_tutorial.html)
 
@@ -30,11 +85,31 @@ Dynamo is correct first. If it cannot trace something, it breaks rather than sil
 
 PyTorch normally computes gradients on the fly during training. That live computation would defeat fusion — the backward pass would re-introduce all the gaps that the forward fusion eliminated.
 
-AOT Autograd runs the forward pass once internally, captures the backward computation graph, and packages both together as a joint graph. This is why `torch.compile` works in training mode — both passes are compiled as one unit.
+AOT Autograd runs the forward pass once internally, captures the backward computation graph, and packages both together as a joint graph:
+
+```
+Joint graph:
+  Forward:  matmul → relu → matmul
+  Backward: matmul_grad ← relu_grad ← matmul_grad
+```
+
+This is why `torch.compile` works in training mode — both passes are compiled as one unit.
 
 ### Stage 3: TorchInductor Emits Optimized Kernels
 
 Inductor receives the joint graph and generates hardware-specific code. On NVIDIA GPUs, it produces Triton kernels — fast, fusion-friendly GPU code written in Python-like syntax. On CPUs, it generates C++ kernels.
+
+What Inductor emits for the fused graph above — a single Triton kernel instead of three:
+
+```triton
+@triton.jit
+def kernel(in_ptr, out_ptr, W1, W2, ...):
+    x = tl.load(in_ptr)
+    h = x @ W1           # matmul
+    h = h * tl.sigmoid(h) * 1.702  # GELU
+    out = h @ W2         # second matmul
+    tl.store(out_ptr, out)
+```
 
 Inductor can fuse `linear → relu → linear → relu` into a single kernel. The GPU never writes intermediate results to memory — values stay in registers between operations.
 
@@ -64,6 +139,33 @@ A graph break is not an error — it is Dynamo pausing compilation for a piece o
 
 The consequence: each break fragments the graph. Fused kernels cannot span a break. You end up with several smaller kernels instead of one big one — and the performance gains evaporate.
 
+```
+Without break:     [==== fused: linear1 + ReLU + linear2 + GELU ====]
+                        all one kernel
+
+With a break:      [== fused: linear1 + ReLU ==]  | break |  [== fused: linear2 + GELU ==]
+                                                 two separate kernels
+```
+
+### Detect graph breaks with dynamo.explain
+
+```python
+import torch._dynamo.explain
+
+explain_output = dynamo.explain(model)
+print(f"Graph breaks: {explain_output.graph_break_count}")
+print(f"Graphs:       {explain_output.graph_count}")
+```
+
+Example output for a model with one graph break:
+
+```
+Graph breaks: 1
+Graphs:       2
+```
+
+Dynamo produced 2 separate compiled graphs instead of 1 — because one piece of code could not be traced. Each graph is a separate GPU kernel launch.
+
 Three common triggers:
 
 **1. Data-dependent control flow**
@@ -86,16 +188,6 @@ Move prints outside the compiled region or use `torch._logging`.
 
 ```python
 len(tensor_shape)         # break: some len() patterns are not yet traced
-```
-
-Detect graph breaks with `torch._dynamo.explain`:
-
-```python
-import torch._dynamo.explain
-
-# Returns an object with every break and its reason
-explain_output = torch._dynamo.explain(model)
-print(f"Graph breaks: {explain_output.graph_break_count}")
 ```
 
 ---
@@ -162,7 +254,13 @@ for node in graph:
     print(node)
 ```
 
-Output:
+Run this:
+
+```
+python tracer.py
+```
+
+You will see:
 
 ```
 ('t3', 'matmul', ['x', 'w1'])
@@ -177,6 +275,27 @@ Each tuple is `(output_name, operation, input_names)`. This is exactly the struc
 ## Fusing Operations
 
 The compiled version is faster partly because TorchInductor fuses adjacent operations into a single kernel. Instead of launching a matmul kernel then a relu kernel, it runs one fused kernel that does both.
+
+### Before and after fusion
+
+The tracer gives us this:
+
+```
+Before fusion:
+  ('t3', 'matmul', ['x', 'w1'])
+  ('t4', 'relu',   ['t3'])
+  ('t5', 'matmul', ['t4', 'w2'])
+```
+
+After the fusion pass:
+
+```
+After fusion:
+  ('t4', 'fused_matmul_relu', ['x', 'w1'])
+  ('t5', 'matmul', ['t4', 'w2'])
+```
+
+`matmul → relu` became one `fused_matmul_relu` node. One kernel instead of three.
 
 ### The fusion pass
 
@@ -203,7 +322,7 @@ def fuse_graph(graph):
     return fused
 ```
 
-Before fusion: `matmul → relu → matmul`. After fusion: `fused_matmul_relu → matmul`. One kernel instead of three.
+TorchInductor does this in hardware — it scans the graph for adjacent compatible ops and merges them into single Triton kernels.
 
 ---
 
@@ -217,7 +336,6 @@ def codegen(graph, fn_name="compiled_fn"):
 
     for out, op, args in graph:
         if op == "fused_matmul_relu":
-            # Fused: matmul and relu in one kernel
             lines.append(f"    {out} = torch.relu({args[0]} @ {args[1]})")
         elif op == "matmul":
             lines.append(f"    {out} = {args[0]} @ {args[1]}")
@@ -229,6 +347,17 @@ def codegen(graph, fn_name="compiled_fn"):
     lines.append(f"    return {graph[-1][0]}")
     return "\n".join(lines)
 ```
+
+Running codegen on the fused graph produces:
+
+```
+def compiled_fn(x, w1, w2):
+    t4 = torch.relu(x @ w1)
+    t5 = t4 @ w2
+    return t5
+```
+
+This is real runnable Python — it is what TorchInductor produces in hardware as a Triton kernel.
 
 ---
 
@@ -336,6 +465,8 @@ for _ in range(10):
 
 ### The benchmark function
 
+This function measures milliseconds per step after warmup. It handles the GPU synchronization that accurate timing requires:
+
 ```python
 import time
 
@@ -376,7 +507,7 @@ print(f"Compiled: {compiled_time*1000:.2f} ms")
 print(f"Speedup:  {eager_time/compiled_time:.2f}x")
 ```
 
-On a typical GPU this gives 1.5–3× speedup on steady-state runs. The first compiled call always costs 2–10 seconds of compilation overhead.
+Run `benchmark.py` on your GPU to get your numbers. Expect roughly ~2-3x speedup on steady-state runs.
 
 ---
 
@@ -395,6 +526,21 @@ torch.compile(model, mode="max-autotune")    # autotuner picks fastest kernel va
 | `"default"` | General use — good balance |
 | `"reduce-overhead"` | Small models where launch overhead dominates. Not guaranteed to work (no input mutation). |
 | `"max-autotune"` | Production, large models. Autotuner tries multiple tiling strategies. Slower to compile. |
+
+Choosing a mode:
+
+```python
+# Rapid iteration — compile time matters
+compiled = torch.compile(model, mode="default")
+
+# Production, large model — maximize runtime performance
+compiled = torch.compile(model, mode="max-autotune")
+
+# Small model — try reduce-overhead first
+compiled = torch.compile(model, mode="reduce-overhead")
+# If it errors at runtime (CUDA graph incompatibility): fall back
+compiled = torch.compile(model, mode="max-autotune-no-cudagraphs")
+```
 
 ### CUDA Graphs: One Sentence
 
@@ -416,7 +562,17 @@ class BadModule(nn.Module):
         return x - 2
 ```
 
-`.item()` extracts a scalar from a tensor, forcing TorchDynamo to fall back to Python. The fix is `torch.where`, which stays in tensor space:
+Running `dynamo.explain` on this module shows the break clearly:
+
+```
+BadModule — dynamo.explain output:
+  Graph breaks: 1
+  Graphs:       2
+```
+
+The model compiled into 2 separate graphs instead of 1 — because `.item()` forced a Python fallback.
+
+The fix is `torch.where`, which stays in tensor space:
 
 ```python
 class FixedModule(nn.Module):
@@ -424,6 +580,16 @@ class FixedModule(nn.Module):
         cond = (x.sum() > 0)         # stays as a tensor — no break
         return torch.where(cond, x * 2, x - 2)
 ```
+
+Running `dynamo.explain` on the fixed module:
+
+```
+FixedModule — dynamo.explain output:
+  Graph breaks: 0
+  Graphs:       1
+```
+
+One graph — fully compiled, fully fused.
 
 ---
 
