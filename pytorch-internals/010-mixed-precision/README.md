@@ -231,3 +231,7 @@ Sources:
 - https://pytorch.org/docs/stable/amp.html
 - https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
 - https://arxiv.org/abs/1710.03740 (Mixed Precision Training)
+
+---
+
+Get the video walkthrough of convergence curves across precision modes, TF32 benchmarks, and GradScaler recovery analysis: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

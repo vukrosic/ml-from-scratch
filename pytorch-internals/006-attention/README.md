@@ -510,3 +510,7 @@ Sources:
 - https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
 - https://arxiv.org/abs/2205.14135 — Flash Attention paper
 - https://pytorch.org/blog/optimizing-cuda-algorithms-with-flash-attention-2
+
+---
+
+Get the video walkthrough of flash attention internals, KV-cache memory profiling, and attention pattern analysis: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

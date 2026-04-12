@@ -560,3 +560,7 @@ loader = DataLoader(
 ## Going Further
 
 For real benchmark numbers across num_workers values, pin_memory speedup measurements, prefetch_factor scaling, and memory profiling of worker processes — see [ADVANCED.md](./ADVANCED.md).
+
+---
+
+Get the video walkthrough of num_workers tuning, pin_memory profiling, and worker memory analysis: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

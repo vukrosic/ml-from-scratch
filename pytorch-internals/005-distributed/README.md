@@ -316,3 +316,7 @@ Sources:
 - https://pytorch.org/tutorials/intermediate/dist_tuto.html
 - https://pytorch.org/docs/stable/distributed.html
 - https://pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html
+
+---
+
+Get the video walkthrough of NCCL vs Gloo benchmarks, multi-node setup, and distributed profiling: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

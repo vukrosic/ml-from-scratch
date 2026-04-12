@@ -62,8 +62,9 @@ Every lesson folder contains:
 **Extended files (covered in paid Skool video):**
 - Additional `.py` files that go deeper (more architectures, profiling, ablations, scanners)
 - These files are FREE to read and run, but the video explaining them is on Skool $49
+- `ADVANCED.md` — optional extended article covering the deep-dive topics. This is the outline/script for the paid Skool video. It references the extended `.py` files and explains what they do in depth.
 
-**No `skool_extended.md` files.** Extended content descriptions go in the README's CTA section, not in a separate planning doc. Keep planning docs out of the public repo.
+**No `skool_extended.md` files.** Keep planning docs out of the public repo. `ADVANCED.md` is viewer-facing (it's a free article that teases the paid video).
 
 ### .gitignore
 Never commit: `__pycache__/`, `*.pyc`, `.ipynb_checkpoints/`, `.env`

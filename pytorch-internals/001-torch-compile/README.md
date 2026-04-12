@@ -613,3 +613,7 @@ For real benchmark numbers on a 4-layer MLP, annotated Triton kernel output, a m
 Sources:
 - https://pytorch.org/tutorials/intermediate/torch_compile_tutorial.html
 - https://pytorch.org/blog/sota-normalization-performance-with-torch-compile
+
+---
+
+Get the video walkthrough of profiling across 5 architectures, annotated Triton kernel output, and the automated graph break scanner: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

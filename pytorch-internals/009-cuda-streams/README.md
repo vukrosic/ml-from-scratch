@@ -410,3 +410,7 @@ Sources:
 - https://pytorch.org/docs/stable/generated/torch.cuda.Stream.html
 - https://pytorch.org/docs/stable/cuda.html#cuda-streams
 - https://developer.nvidia.com/blog/how-cuda-streams-make-concurrent-gpu-execution-possible
+
+---
+
+Get the video walkthrough of multi-stream benchmarks, Nsight Systems profiling, and PCIe transfer overlap: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)

@@ -363,3 +363,7 @@ For convergence benchmarks comparing SGD vs Adam vs AdamW on a 4-layer MLP acros
 Sources:
 - https://arxiv.org/abs/1609.04747 — Adam paper
 - https://arxiv.org/abs/1711.05101 — Decoupled weight decay (AdamW)
+
+---
+
+Get the video walkthrough of SGD vs Adam vs AdamW convergence benchmarks and optimizer selection guide: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)
