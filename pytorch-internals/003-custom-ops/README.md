@@ -1,7 +1,7 @@
 # Custom Ops — PyTorch Internals
 
-> 🎥 YouTube Lesson: Coming soon
-> 🎓 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
+> 🔴 YouTube Lesson: Coming soon
+> 🟡 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
 
 PyTorch's autograd engine computes gradients automatically, but sometimes you need to tell it exactly how. Custom ops let you define the forward and backward behavior yourself, and with `torch.library` you can register them so `torch.compile` sees them as first-class graph nodes.
 

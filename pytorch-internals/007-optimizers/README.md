@@ -1,7 +1,7 @@
 # Optimizer Internals From Scratch
 
-> 🎥 YouTube Lesson: Coming soon
-> 🎓 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
+> 🔴 YouTube Lesson: Coming soon
+> 🟡 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
 
 Every optimizer is the same idea — update weights in the direction that reduces loss — but the path you take to get there changes everything. This is what SGD, Adam, and AdamW actually do under the hood.
 

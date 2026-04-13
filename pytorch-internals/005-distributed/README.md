@@ -1,7 +1,7 @@
 # Distributed Training From Scratch
 
-> 🎥 YouTube Lesson: Coming soon
-> 🎓 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
+> 🔴 YouTube Lesson: Coming soon
+> 🟡 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
 
 Multi-GPU training speeds up your job proportionally to the number of GPUs — until communication overhead eats your gains. Understanding how PyTorch actually moves data between processes is what lets you push beyond toy benchmarks and scale to real workloads. This is how `torch.distributed` actually works.
 

@@ -1,7 +1,7 @@
 # DataLoader From Scratch
 
-> 🎥 YouTube Lesson: Coming soon
-> 🎓 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
+> 🔴 YouTube Lesson: Coming soon
+> 🟡 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
 
 You need to feed data to your model efficiently. DataLoader is the pipe, and understanding its internals lets you avoid the bottlenecks that slow training.
 

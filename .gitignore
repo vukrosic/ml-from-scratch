@@ -13,7 +13,7 @@ PRODUCTION.md
 ROADMAP.md
 
 # Tutorials config — publish later
-tutorials/*.yml
+tutorials/
 
 # PyTorch internals — only torch.compile and autograd are ready
 pytorch-internals/TUTORIAL_PLAN.md
