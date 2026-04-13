@@ -1,0 +1,35 @@
+day: 1
+slug: pytorch-compile-from-scratch
+yt_title: torch.compile From Scratch — Your PyTorch Model Is Slower Than It Needs
+  to Be
+yt_description: 'Most PyTorch models run 2-3x slower than they could. In this tutorial
+  I implement torch.compile from scratch — tracing the computation graph, fusing operations,
+  and generating Triton GPU kernels. You''ll see exactly how PyTorch turns your Python
+  model into optimized GPU code, and why graph breaks kill performance.
+
+
+  Code: https://github.com/vukrosic/ml-from-scratch
+
+
+  Timestamps:
+
+  0:00 Why your model is slow
+
+  ...'
+yt_tags:
+- torch.compile tutorial
+- pytorch torch compile explained
+- pytorch model optimization gpu
+- triton kernel generation pytorch
+- pytorch graph compilation
+- how torch compile works internally
+- pytorch 2.0 compiler tutorial
+- speed up pytorch training
+- pytorch dynamo tracing
+- gpu kernel fusion pytorch
+- pytorch performance optimization 2026
+- ml from scratch series
+thumbnail_idea: ''
+publish_date: '2026-04-12'
+yt_url: ''
+notes: ''

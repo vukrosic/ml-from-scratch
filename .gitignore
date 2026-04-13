@@ -6,3 +6,9 @@ __pycache__/
 dist/
 build/
 .env
+
+# Tutorials - only publish torch.compile for now
+tutorials/*
+!tutorials/01-torch-compile.yml
+research-papers/
+tools/
