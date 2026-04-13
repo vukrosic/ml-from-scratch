@@ -50,12 +50,23 @@ W = [[w00, w01, w02],
 y = W @ x = [w00*x0 + w01*x1 + w02*x2,
              w10*x0 + w11*x1 + w12*x2]    ← shape (2,)
 
-Jacobian dy/dx has shape (2, 3):
-J = [[d(y0)/d(x0), d(y0)/d(x1), d(y0)/d(x2)],     [[w00, w01, w02],
-     [d(y1)/d(x0), d(y1)/d(x1), d(y1)/d(x2)]]   =   [w10, w11, w12]]   = W
+Jacobian dy/dx has shape (2, 3). Expanding each element:
+
+```
+d(y_i)/d(x_j) = w_ij   (the (i,j)-th element of W)
 ```
 
-The Jacobian of a matrix multiply `y = W @ x` with respect to `x` is just `W` itself.
+So the Jacobian matrix is simply W itself:
+
+```
+          ∂y               ∂y
+dy/dx = -------   =  [[w00, w01, w02],     =  [[w00, w01, w02],
+        ∂x                 [w10, w11, w12]]      [w10, w11, w12]]
+
+                         =  W
+```
+
+This is a key insight: for a linear layer `y = W @ x`, the Jacobian `∂y/∂x` is just `W`. PyTorch never materializes this matrix — it uses `W` directly in the VJP.
 
 ### The VJP trick
 
@@ -386,38 +397,6 @@ When would you write a custom Function? When you have an operation that:
 
 ---
 
-## Gradient Checkpointing: Trading Compute for Memory
-
-In a deep network, the forward pass stores activations at every layer for the backward pass. For a 100-layer network, that is 100 sets of activations in memory simultaneously.
-
-**Gradient checkpointing** drops intermediate activations and recomputes them during backward:
-
-```
-Normal (high memory):
-  Forward:   L1 → L2 → L3 → L4 → L5 → loss
-  Stored:    [a1] [a2] [a3] [a4] [a5]         ← all in memory
-
-Checkpointed (low memory):
-  Forward:   L1 → L2 → L3 → L4 → L5 → loss
-  Stored:    [a1]       [a3]       [a5]        ← only checkpoints kept
-  Backward:  recompute a2 from a1, recompute a4 from a3
-```
-
-Memory drops from O(n) to O(sqrt(n)) layers. The cost: each non-checkpointed layer is computed twice — once in forward, once in backward.
-
-In PyTorch:
-
-```python
-from torch.utils.checkpoint import checkpoint
-
-# Instead of:  y = self.block(x)
-# Use:         y = checkpoint(self.block, x, use_reentrant=False)
-```
-
-Our tiny engine has no memory pressure — everything is a single float. But the principle is the same: you can drop intermediate values and recompute them from checkpoints.
-
----
-
 ## `retain_grad()` and Non-Leaf Tensors
 
 In PyTorch, only **leaf tensors** (tensors you create directly, like parameters) keep their `.grad` after `backward()`. Intermediate tensors have their gradients freed to save memory.
@@ -517,57 +496,6 @@ In our engine, the equivalent would be creating Value objects that never set `_b
 
 ---
 
-## Higher-Order Gradients
-
-PyTorch can differentiate through the backward pass itself — gradients of gradients. Let's trace through a concrete example:
-
-```python
-x = torch.tensor([2.0], requires_grad=True)
-y = x ** 3          # y = x^3 = 8.0
-```
-
-**First derivative:**
-
-```python
-dy_dx = torch.autograd.grad(y, x, create_graph=True)[0]
-# dy/dx = 3x^2 = 3 * 4 = 12.0
-```
-
-`torch.autograd.grad` computes the gradient without storing it in `x.grad`. The key is `create_graph=True` — this tells PyTorch: "build a computation graph for the gradient computation itself." Without it, `dy_dx` would be a plain tensor with no graph attached.
-
-With `create_graph=True`, `dy_dx` is a tensor that knows it came from `3 * x * x`. It has its own `grad_fn`.
-
-**Second derivative:**
-
-```python
-d2y_dx2 = torch.autograd.grad(dy_dx, x)[0]
-# d^2y/dx^2 = 6x = 6 * 2 = 12.0
-print(d2y_dx2)      # tensor([12.])
-```
-
-This differentiates `dy_dx = 3x^2` with respect to `x`, giving `6x = 12`. It works because `dy_dx` has a computation graph (thanks to `create_graph=True`), so PyTorch can run backward through it again.
-
-```
-Normal backward:
-  y = x^3
-  backward computes: dy/dx = 3x^2    ← result has no graph, cannot differentiate further
-
-create_graph=True backward:
-  y = x^3
-  backward computes: dy/dx = 3x^2    ← result HAS a graph (3 * x * x)
-  second backward:   d^2y/dx^2 = 6x  ← differentiates through the first backward's graph
-```
-
-This is used in:
-
-- **Meta-learning** (MAML) — gradients through the optimization step: you need `d(loss_test) / d(theta_initial)`, which requires differentiating through `theta_updated = theta_initial - lr * grad`
-- **Regularization** — penalizing gradient magnitude: `loss += lambda * grad.norm()` requires the gradient of a gradient
-- **Physics-informed neural networks** — enforcing PDE constraints like `d^2u/dx^2 + d^2u/dy^2 = 0` requires second derivatives
-
-Our engine cannot do this because `_backward` closures use plain Python arithmetic (`float` operations) that do not build a Value graph. To support higher-order gradients, each `_backward` closure would need to create new Value nodes for its own computations — the backward pass would itself be recorded on the tape.
-
----
-
 ## Common Bugs and Debugging
 
 ### Bug 1: Forgetting `+=` (gradient overwrite)
@@ -580,7 +508,7 @@ self.grad = other.data * out.grad
 self.grad += other.data * out.grad
 ```
 
-**Symptom**: gradients are wrong when a value is used more than once. Only the last path contributes.
+**Symptom**: gradients are wrong when a value is used in more than one place. Only the last path contributes.
 
 ### Bug 2: Missing `zero_grad()` between iterations
 
@@ -666,6 +594,78 @@ with torch.autograd.detect_anomaly():
 
 ---
 
+## Higher-Order Gradients
+
+PyTorch can differentiate through the backward pass itself — gradients of gradients. Let's trace through a concrete example:
+
+```python
+x = torch.tensor([2.0], requires_grad=True)
+y = x ** 3          # y = x^3 = 8.0
+```
+
+**First derivative:**
+
+```python
+dy_dx = torch.autograd.grad(y, x, create_graph=True)[0]
+# dy/dx = 3x^2 = 3 * 4 = 12.0
+```
+
+`torch.autograd.grad` computes the gradient without storing it in `x.grad`. The key is `create_graph=True` — this tells PyTorch: "build a computation graph for the gradient computation itself." Without it, `dy_dx` would be a plain tensor with no graph attached.
+
+With `create_graph=True`, `dy_dx` is a tensor that knows it came from `3 * x * x`. It has its own `grad_fn`.
+
+**Second derivative:**
+
+```python
+d2y_dx2 = torch.autograd.grad(dy_dx, x)[0]
+# d^2y/dx^2 = 6x = 6 * 2 = 12.0
+print(d2y_dx2)      # tensor([12.])
+```
+
+This differentiates `dy_dx = 3x^2` with respect to `x`, giving `6x = 12`. It works because `dy_dx` has a computation graph (thanks to `create_graph=True`), so PyTorch can run backward through it again.
+
+```
+Normal backward:
+  y = x^3
+  backward computes: dy/dx = 3x^2    ← result has no graph, cannot differentiate further
+
+create_graph=True backward:
+  y = x^3
+  backward computes: dy/dx = 3x^2    ← result HAS a graph (3 * x * x)
+  second backward:   d^2y/dx^2 = 6x  ← differentiates through the first backward's graph
+```
+
+This is used in:
+
+- **Meta-learning** (MAML) — gradients through the optimization step: you need `d(loss_test) / d(theta_initial)`, which requires differentiating through `theta_updated = theta_initial - lr * grad`
+- **Regularization** — penalizing gradient magnitude: `loss += lambda * grad.norm()` requires the gradient of a gradient
+- **Physics-informed neural networks** — enforcing PDE constraints like `d^2u/dx^2 + d^2u/dy^2 = 0` requires second derivatives
+
+Our engine cannot do this because `_backward` closures use plain Python arithmetic (`float` operations) that do not build a Value graph. To support higher-order gradients, each `_backward` closure would need to create new Value nodes for its own computations — the backward pass would itself be recorded on the tape.
+
+**What would need to change in our engine?** Today, `backward()` does this:
+
+```python
+self.grad = 1.0
+for node in reversed(order):
+    node._backward()   # just Python math — result is a float, not a Value
+```
+
+To support higher-order gradients, `_backward()` would need to **record** its computation as a new Value node, not just do arithmetic:
+
+```python
+# Hypothetical: backward that builds a graph
+def _backward():
+    # Instead of: self.grad += other.data * out.grad  (plain float)
+    # We would do:
+    grad_value = other.data * out.grad    # creates a NEW Value node
+    self.grad_node = self.grad_node + grad_value   # records this op in the tape
+```
+
+Then calling `backward()` on the gradient *itself* would replay *that* tape. The backward pass becomes a forward pass — you need a tape of the backward pass to differentiate through it. PyTorch handles this with `create_graph=True` in `torch.autograd.grad`.
+
+---
+
 ## Memory: Where Autograd Bytes Go
 
 For a model with `N` parameters and `L` layers:
@@ -694,6 +694,38 @@ Total:       ~40 GB
 ```
 
 This is why gradient checkpointing, mixed precision (FP16 halves activation memory), and activation offloading exist. The autograd graph itself is small — the activations it holds references to are large.
+
+---
+
+## Gradient Checkpointing: Trading Compute for Memory
+
+In a deep network, the forward pass stores activations at every layer for the backward pass. For a 100-layer network, that is 100 sets of activations in memory simultaneously.
+
+**Gradient checkpointing** drops intermediate activations and recomputes them during backward:
+
+```
+Normal (high memory):
+  Forward:   L1 → L2 → L3 → L4 → L5 → loss
+  Stored:    [a1] [a2] [a3] [a4] [a5]         ← all in memory
+
+Checkpointed (low memory):
+  Forward:   L1 → L2 → L3 → L4 → L5 → loss
+  Stored:    [a1]       [a3]       [a5]        ← only checkpoints kept
+  Backward:  recompute a2 from a1, recompute a4 from a3
+```
+
+Memory drops from O(n) to O(sqrt(n)) layers. The cost: each non-checkpointed layer is computed twice — once in forward, once in backward.
+
+In PyTorch:
+
+```python
+from torch.utils.checkpoint import checkpoint
+
+# Instead of:  y = self.block(x)
+# Use:         y = checkpoint(self.block, x, use_reentrant=False)
+```
+
+Our tiny engine has no memory pressure — everything is a single float. But the principle is the same: you can drop intermediate values and recompute them from checkpoints.
 
 ---
 

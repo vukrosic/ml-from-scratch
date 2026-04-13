@@ -79,6 +79,122 @@ self._label = label or f"v{id(self)}"
 ```
 A human-readable name for debugging and visualization. You can pass `label="a"` or let it auto-generate.
 
+---
+
+## Putting It Together: The Complete `Value` Class
+
+Here is the full ~100 line implementation — every concept above combined into one runnable class:
+
+```python
+import math
+
+class Value:
+    """A scalar that knows how to compute its own gradient."""
+
+    _id = 0
+
+    def __init__(self, data, _op=None, _prev=(), label=None):
+        self.data = float(data)
+        self.grad = 0.0
+        self._op = _op           # operation that created this node
+        self._prev = _prev       # tuple of input Value nodes
+        self._backward = lambda: None   # accumulates gradient into inputs
+        self._label = label or f"v{Value._id}"
+        Value._id += 1
+
+    # ---- Operations ----------------------------------------------------
+
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data + other.data, _op="+", _prev=(self, other))
+
+        def _backward():
+            self.grad  += out.grad
+            other.grad += out.grad
+
+        out._backward = _backward
+        return out
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data * other.data, _op="*", _prev=(self, other))
+
+        def _backward():
+            self.grad  += other.data * out.grad
+            other.grad += self.data  * out.grad
+
+        out._backward = _backward
+        return out
+
+    def __rmul__(self, other):
+        return self.__mul__(other)
+
+    def relu(self):
+        out = Value(max(0.0, self.data), _op="relu", _prev=(self,))
+
+        def _backward():
+            self.grad += (self.data > 0) * out.grad
+
+        out._backward = _backward
+        return out
+
+    def tanh(self):
+        t = math.tanh(self.data)
+        out = Value(t, _op="tanh", _prev=(self,))
+
+        def _backward():
+            self.grad += (1 - t * t) * out.grad
+
+        out._backward = _backward
+        return out
+
+    # ---- Backward pass -------------------------------------------------
+
+    def backward(self):
+        """Topologically sort the graph and replay the tape."""
+        visited = set()
+        order = []
+
+        def build_order(v):
+            if v in visited:
+                return
+            visited.add(v)
+            for child in v._prev:
+                build_order(child)
+            order.append(v)
+
+        build_order(self)
+        self.grad = 1.0                      # seed: d(loss)/d(loss) = 1
+        for node in reversed(order):
+            node._backward()
+```
+
+You can copy-paste this directly into a Python file and run it. The file `autograd.py` in this directory contains the same implementation plus a `GradientTape` helper and example usage.
+
+---
+
+## Calling `backward()` Multiple Times
+
+A common question: **what happens if you call `backward()` twice?**
+
+The gradients **accumulate** rather than reset. Each `backward()` call propagates `self.grad = 1.0` as the seed and pushes gradients through the graph using `+=`. This means:
+
+```python
+a = Value(2.0, label="a")
+b = a * a
+b.backward()   # a.grad = 2 * a = 4.0
+b.backward()   # a.grad = 4.0 + 4.0 = 8.0  (accumulates!)
+```
+
+In PyTorch this is the same — `optimizer.step()` does not clear gradients; you must call `optimizer.zero_grad()` explicitly. This design choice exists because **gradient accumulation** is a real technique: when a GPU cannot fit a large batch, you run several small batches and accumulate gradients before stepping.
+
+To reset gradients to zero before a second pass, re-create the Value objects. The old nodes have no way to know they should reset.
+
+---
+
 The `_prev` edges form the **computation graph** — a directed acyclic graph (DAG) where each node is an operation and each edge is a data dependency. The graph is built implicitly as you write normal Python expressions. When you write `c = a + b`, Python calls `a.__add__(b)`, which creates a new Value with `_prev=(a, b)` — no explicit graph-building step needed.
 
 ---
@@ -505,6 +621,20 @@ This is a scalar engine — it operates on single floats, not tensors. PyTorch's
 - **Higher-order gradients** — gradients of gradients for meta-learning
 
 These are covered in [ADVANCED.md](./ADVANCED.md).
+
+---
+
+## Common Pitfalls
+
+Before diving into ADVANCED, be aware of the most frequent mistakes even experienced practitioners make with autograd:
+
+| Mistake | Symptom | Fix |
+|---------|---------|-----|
+| Using `=` instead of `+=` in `_backward` | Gradients are wrong when a node is used in multiple places | Always use `+=` — see the `+=` explanation above |
+| Calling `backward()` twice without resetting | Gradients accumulate (sometimes intended, sometimes not) | Re-create `Value` objects for fresh runs |
+| In-place modification of a tensor used in the graph | Silent wrong gradients (or crash in PyTorch) | Use out-of-place ops: `x = x + 1` not `x += 1` |
+
+> **ADVANCED.md covers these in depth**, including how PyTorch's version counter detects in-place corruption, how hooks can clip gradients mid-flight, and why `zero_grad()` is necessary between training iterations.
 
 ---
 
