@@ -17,14 +17,6 @@ tutorials/*
 !tutorials/01-torch-compile.yml
 
 # PyTorch internals — only torch.compile and autograd are ready
-pytorch-internals/003-custom-ops/
-pytorch-internals/004-memory-management/
-pytorch-internals/005-distributed/
-pytorch-internals/006-attention/
-pytorch-internals/007-optimizers/
-pytorch-internals/008-dataloader/
-pytorch-internals/009-cuda-streams/
-pytorch-internals/010-mixed-precision/
 pytorch-internals/TUTORIAL_PLAN.md
 
 # Other tutorial series — publish later
