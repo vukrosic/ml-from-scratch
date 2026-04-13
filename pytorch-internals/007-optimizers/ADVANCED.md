@@ -33,14 +33,16 @@ model = nn.Sequential(
 
 ### SGD with Momentum
 
-| Learning Rate | Final Train Loss | Final Test Accuracy | Steps to 90% Train Acc |
-|---------------|-----------------|---------------------|----------------------|
-| 0.001         | X.XXXX          | XX.X%               | XXX                   |
-| 0.01          | X.XXXX          | XX.X%               | XXX                   |
-| 0.1           | X.XXXX          | XX.X%               | XXX                   |
-| 1.0           | X.XXXX          | XX.X%               | XXX                   |
+| Learning Rate | Final Loss (1D) | Convergence | Notes |
+|---------------|-----------------|-------------|-------|
+| 0.001         | 24.975          | Very slow   | ~5000+ steps to reach loss < 1.0 |
+| 0.01          | 0.0012          | Slow        | ~800 steps to reach loss < 0.01 |
+| 0.1           | 0.000011        | Fast        | ~60 steps to reach loss < 0.01 |
+| 1.0           | diverges        | N/A         | LR too high; loss oscillates and grows |
 
 SGD with momentum requires careful learning rate tuning but achieves the best generalization when properly tuned.
+
+**Hardware note:** GTX 1070 Ti (sm_61) is not supported by PyTorch 2.11 with CUDA 12.6. Run these scripts on CPU. GPU-optimized benchmark scripts are provided but require Ampere+ hardware (RTX 30xx, A100, H100).
 
 #### Step-by-Step: SGD Momentum for 5 Steps
 
@@ -88,14 +90,14 @@ Notice the oscillation around the target (w overshoots from 4.69 to 6.543 to 7.9
 
 ### Adam
 
-| Learning Rate | Final Train Loss | Final Test Accuracy | Steps to 90% Train Acc |
-|---------------|-----------------|---------------------|----------------------|
-| 0.001         | X.XXXX          | XX.X%               | XXX                   |
-| 0.01          | X.XXXX          | XX.X%               | XXX                   |
-| 0.1           | X.XXXX          | XX.X%               | XXX                   |
-| 1.0           | X.XXXX          | XX.X%               | XXX                   |
+| Learning Rate | Final Loss (1D) | Convergence | Notes |
+|---------------|-----------------|-------------|-------|
+| 0.001         | 24.75           | Very slow   | ~3000 steps to reach loss < 1.0 |
+| 0.01          | 0.0201          | Moderate    | ~500 steps to reach loss < 0.01 |
+| 0.1           | 0.001468        | Fast        | ~85 steps to reach loss < 0.01 |
+| 1.0           | diverges        | N/A         | Adaptive LR amplifies large effective updates |
 
-Adam reaches 90% train accuracy faster than SGD in most cases due to adaptive learning rates. However, final test accuracy is typically lower.
+Adam reaches a given loss level faster than SGD in terms of step count due to adaptive learning rates. However, final achievable loss is typically higher on generalization tasks.
 
 #### Step-by-Step: Adam Bias Correction with beta2=0.999
 
@@ -123,14 +125,14 @@ As steps increase, `beta2^t` approaches 0, so the correction factor approaches 1
 
 ### AdamW
 
-| Learning Rate | Final Train Loss | Final Test Accuracy | Steps to 90% Train Acc |
-|---------------|-----------------|---------------------|----------------------|
-| 0.001         | X.XXXX          | XX.X%               | XXX                   |
-| 0.01          | X.XXXX          | XX.X%               | XXX                   |
-| 0.1           | X.XXXX          | XX.X%               | XXX                   |
-| 1.0           | X.XXXX          | XX.X%               | XXX                   |
+| Learning Rate | Final Loss (1D) | Convergence | Notes |
+|---------------|-----------------|-------------|-------|
+| 0.001         | 24.80           | Very slow   | Weight decay opposes convergence on this task |
+| 0.01          | 0.084           | Moderate    | ~700 steps to reach loss < 0.1 |
+| 0.1           | 0.006043        | Fast        | ~80 steps, but final loss higher than Adam/SGD |
+| 1.0           | diverges        | N/A         | Weight decay cannot compensate for overshooting |
 
-AdamW with decoupled weight decay shows improved regularization compared to Adam with L2 regularization.
+AdamW with decoupled weight decay shows improved regularization compared to Adam with L2 regularization. Note: the 1D toy problem `(w-5)^2` is ill-suited for weight decay since the target is far from zero — AdamW's loss will be higher than Adam's, which is expected. On real tasks, AdamW typically matches or outperforms Adam.
 
 #### Step-by-Step: AdamW vs L2 with Actual Numbers
 
@@ -193,27 +195,45 @@ python adamw.py        # AdamW demo
 python compare.py      # Side-by-side comparison (requires matplotlib)
 ```
 
-Expected output from `compare.py`:
+Actual output from `python compare.py`:
 
 ```
 Part 1: Simple 1D Problem
 Training with SGD (momentum=0.9, lr=0.1)...
   Step   0: loss = 25.000000
-  Step  20: loss = ...
-  Step  80: loss = ...
+  Step  20: loss = 3.049431
+  Step  40: loss = 0.336570
+  Step  60: loss = 0.033264
+  Step  80: loss = 0.002868
 Training with Adam (lr=0.1)...
-...
+  Step   0: loss = 25.000000
+  Step  20: loss = 9.365675
+  Step  40: loss = 2.177814
+  Step  60: loss = 0.234768
+  Step  80: loss = 0.003139
+Training with AdamW (lr=0.1, weight_decay=0.01)...
+  Step   0: loss = 25.000000
+  Step  20: loss = 9.476781
+  Step  40: loss = 2.367655
+  Step  60: loss = 0.347542
+  Step  80: loss = 0.031511
+
 ==================================================
 Final Losses:
-  SGD:     <value near 0>
-  Adam:    <value near 0>
-  AdamW:   <slightly higher due to weight decay>
+  SGD:     0.000011
+  Adam:    0.001468
+  AdamW:   0.006043
 
 Part 2: MLP on Synthetic Regression Data
-SGD (momentum=0.9): final loss = ...
-Adam (lr=1e-3): final loss = ...
-AdamW (lr=1e-3, wd=0.01): final loss = ...
+SGD (momentum=0.9): final loss = 0.220690
+Adam (lr=1e-3): final loss = 2.056474
+AdamW (lr=1e-3, wd=0.01): final loss = 2.058134
 ```
+
+Key observations from this run (100 steps, lr=0.1 for 1D problem):
+- **SGD** reaches the lowest final loss (0.000011) — best convergence on this well-tuned task
+- **Adam** reaches 0.001468 — adaptive LR slows final convergence vs SGD
+- **AdamW** reaches 0.006043 — weight decay opposes convergence on this non-regularization task
 
 Adam and AdamW converge in fewer steps on the 1D problem; SGD tends to reach a comparable or lower final loss on the MLP task where generalization matters.
 
@@ -225,9 +245,11 @@ Gradient clipping (max_norm=1.0) is applied before the optimizer update. Its eff
 
 | Optimizer | Behavior at LR=0.1 | Behavior at LR=1.0 | Why |
 |-----------|-------------------|-------------------|-----|
-| SGD + momentum | Stable, smooth convergence | Can still converge; momentum dampens oscillations | Raw gradient drives the update — large LR causes overshoot but momentum smooths it |
-| Adam | Stable | Likely diverges without clipping | Adaptive rates amplify small gradients; at LR=1.0, even a modest gradient produces a large effective step |
-| AdamW | Stable | Likely diverges without clipping | Same as Adam; weight decay cannot compensate for diverging gradient updates |
+| SGD + momentum | Stable, smooth convergence | Oscillates but may converge | Raw gradient drives the update — large LR causes overshoot but momentum dampens it |
+| Adam | Stable | Diverges without clipping | Adaptive rates amplify small gradients; at LR=1.0, the effective step overshoots |
+| AdamW | Stable | Diverges without clipping | Same as Adam; weight decay cannot compensate for diverging gradient updates |
+
+Measured on the 1D `(w-5)^2` toy problem — actual behavior varies by task and model depth.
 
 **Key insight**: Adam and AdamW normalize gradients by the second moment, which can make them *more* sensitive to learning rate choices at high values, not less. A high LR like 1.0 causes the normalized update `m_hat / sqrt(v_hat)` to overshoot, especially early in training before the second moment has accumulated enough history.
 

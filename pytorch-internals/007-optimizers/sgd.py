@@ -43,7 +43,7 @@ def demo():
         # Manual momentum update (equivalent to optimizer.step())
         with torch.no_grad():
             velocity = 0.9 * velocity + w.grad
-            w = w - 0.1 * velocity
+            w.data -= 0.1 * velocity
 
         w.retain_grad()
         print(f"Step {step:3d}: w = {w.item():.4f}, loss = {loss.item():.4f}, velocity = {velocity.item():.4f}")
