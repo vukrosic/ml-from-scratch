@@ -7,8 +7,23 @@ dist/
 build/
 .env
 
-# Tutorials - only publish torch.compile for now
+# Tutorials - only publish torch.compile and autograd for now
 tutorials/*
 !tutorials/01-torch-compile.yml
 research-papers/
 tools/
+
+# PyTorch internals - only publish torch.compile and autograd for now
+pytorch-internals/003-custom-ops/
+pytorch-internals/004-memory-management/
+pytorch-internals/005-distributed/
+pytorch-internals/006-attention/
+pytorch-internals/007-optimizers/
+pytorch-internals/008-dataloader/
+pytorch-internals/009-cuda-streams/
+pytorch-internals/010-mixed-precision/
+
+# Other tutorial series - publish later
+inference/
+training-recipes/
+transformer-from-scratch/
