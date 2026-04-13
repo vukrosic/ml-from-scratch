@@ -7,13 +7,16 @@ dist/
 build/
 .env
 
-# Tutorials - only publish torch.compile and autograd for now
+# Internal docs — not for public repo
+AGENT-INSTRUCTIONS.md
+PRODUCTION.md
+ROADMAP.md
+
+# Tutorials config — publish later
 tutorials/*
 !tutorials/01-torch-compile.yml
-research-papers/
-tools/
 
-# PyTorch internals - only publish torch.compile and autograd for now
+# PyTorch internals — only torch.compile and autograd are ready
 pytorch-internals/003-custom-ops/
 pytorch-internals/004-memory-management/
 pytorch-internals/005-distributed/
@@ -22,8 +25,11 @@ pytorch-internals/007-optimizers/
 pytorch-internals/008-dataloader/
 pytorch-internals/009-cuda-streams/
 pytorch-internals/010-mixed-precision/
+pytorch-internals/TUTORIAL_PLAN.md
 
-# Other tutorial series - publish later
+# Other tutorial series — publish later
 inference/
 training-recipes/
 transformer-from-scratch/
+research-papers/
+tools/

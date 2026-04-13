@@ -1,14 +1,78 @@
 # ML From Scratch
 
-Daily deep-learning tutorials. Code is free forever. Video explanations on [YouTube](https://youtube.com/@opensuperintelligencelab).
+Learn how deep learning actually works by building everything from scratch in Python. Every tutorial starts from zero — no frameworks, no wrappers — then compares against PyTorch to prove it works.
 
-## Series
+All code is free and open source. Video walkthroughs on [YouTube](https://youtube.com/@opensuperintelligencelab).
 
-| Series | Topics | Lessons |
-|--------|--------|---------|
-| [pytorch-internals](pytorch-internals/) | torch.compile, autograd, CUDA kernels, profiling | 10 |
-| [transformer-from-scratch](transformer-from-scratch/) | softmax, attention, tokenization, full transformer | 10 |
-| [training-recipes](training-recipes/) | optimizers, schedules, checkpointing, augmentation | 10 |
-| [inference](inference/) | KV-cache, quantization, flash attention, LoRA | 10 |
-| [research-papers](research-papers/) | Attention paper, GPT, BERT, ViT, diffusion, MoE | 10 |
-| [tools](tools/) | profiling, wandb, docker, slurm | 5 |
+## Tutorials
+
+### PyTorch Internals
+
+How PyTorch works under the hood. Each lesson builds a toy version of a real PyTorch subsystem, then shows you the real thing.
+
+| # | Tutorial | What you build | What you learn |
+|---|----------|---------------|----------------|
+| 001 | [torch.compile](pytorch-internals/001-torch-compile/) | A graph tracer, fusion pass, and code generator | How TorchDynamo traces Python, how TorchInductor fuses operations into Triton kernels, what graph breaks are and how to fix them |
+| 002 | [Autograd](pytorch-internals/002-autograd/) | A scalar autograd engine with `backward()` | How `loss.backward()` works — computation graphs, the chain rule, topological sort, gradient accumulation |
+
+More tutorials coming soon.
+
+## How Each Tutorial Works
+
+Every tutorial folder contains:
+
+- **README.md** -- the core article explaining the concept step by step, with small code blocks and concrete examples
+- **Python files** -- runnable implementations you can execute immediately (`python autograd.py`)
+- **ADVANCED.md** -- deeper coverage: benchmarks, profiling, PyTorch internals, edge cases, and debugging techniques
+
+The README teaches the concept. The Python files let you run it. ADVANCED goes deeper for those who want the full picture.
+
+## Running the Code
+
+```bash
+# Clone the repo
+git clone https://github.com/vukrosic/ml-from-scratch.git
+cd ml-from-scratch
+
+# Pick a tutorial and run it
+cd pytorch-internals/002-autograd
+python autograd.py          # run the from-scratch implementation
+python compare.py           # verify against PyTorch
+python visualize.py         # see the computation graph
+```
+
+Each tutorial is self-contained. No cross-dependencies between lessons. You need Python 3.8+ and PyTorch for the comparison scripts.
+
+```bash
+pip install torch
+```
+
+## Structure
+
+```
+ml-from-scratch/
+└── pytorch-internals/
+    ├── 001-torch-compile/     # graph tracing, fusion, code generation
+    │   ├── README.md
+    │   ├── ADVANCED.md
+    │   ├── tracer.py
+    │   ├── fusion.py
+    │   ├── codegen.py
+    │   ├── benchmark.py
+    │   ├── graph_breaks.py
+    │   ├── graph_break_scanner.py
+    │   ├── benchmark_modes.py
+    │   └── profile_architectures.py
+    │
+    └── 002-autograd/          # computation graphs, chain rule, backward pass
+        ├── README.md
+        ├── ADVANCED.md
+        ├── autograd.py
+        ├── compare.py
+        └── visualize.py
+```
+
+## Links
+
+- [YouTube](https://youtube.com/@opensuperintelligencelab) -- free video walkthroughs
+- [Skool](https://www.skool.com/opensuperintelligencelab) -- extended video explanations of the advanced code and deep-dive topics
