@@ -105,15 +105,17 @@ Gradient sync issues often appear as mismatched parameter values after `backward
 import numpy as np
 
 # Check if gradients are synchronized across ranks
+# To verify sync, each rank's local gradient (before any all_reduce)
+# must be identical — otherwise the averaged result will differ
 for name, param in model.named_parameters():
     if param.grad is not None:
-        # Gather gradients from all ranks to compare
+        # Gather each rank's local gradient before DDP reduction
         grad_tensor = param.grad.clone()
         grads = [torch.zeros_like(grad_tensor) for _ in range(world_size)]
         dist.all_gather(grads, grad_tensor)
 
         if rank == 0:
-            # Compare all ranks' gradients to rank 0's
+            # Compare all ranks' local gradients to rank 0's
             rank0_grad = grads[0].cpu().numpy()
             for r, g in enumerate(grads[1:], 1):
                 if not np.allclose(rank0_grad, g.cpu().numpy(), rtol=1e-5, atol=1e-5):
@@ -248,9 +250,9 @@ On each node, before running training:
 nc -zv 192.168.1.100 29500
 ```
 
-`nc -zv` (scan mode) only verifies that the target port is open and something is listening — it sends a TCP SYN and confirms a SYN-ACK is received. It does NOT verify:
+`nc -zv` (scan mode) sends a TCP SYN to the target and confirms receipt of SYN-ACK — this verifies that your node can reach the master's port. It does NOT verify:
 - That your application can actually bind to and use the port
-- Bidirectional communication (e.g., the target can send data back to you)
+- Bidirectional communication (the master cannot send data back to you using this check alone)
 - That NCCL's specific transport (whether using sockets, RDMA, or InfiniBand) will work
 
 A port can appear open yet NCCL initialization still fail due to firewall rules, routing issues, or NIC configuration.
