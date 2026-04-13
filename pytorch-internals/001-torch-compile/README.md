@@ -1,7 +1,6 @@
 # torch.compile From Scratch
 
-> 🔴 YouTube Lesson: [Watch the video](https://youtu.be/oO5e9mFFsk4)
-> 🟡 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/classroom/8cd7511a?md=bdb7b87c0ba04947a33f2e91d065a5b8)
+> 🔴 YouTube Lesson: [Watch the video](https://youtu.be/oO5e9mFFsk4) | 🟡 Skool Advanced Video Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/classroom/8cd7511a?md=bdb7b87c0ba04947a33f2e91d065a5b8)
 
 One line of code turns your PyTorch model into a fused GPU kernel — and it runs 2–5× faster. But the same line silently breaks your model if you do not understand what is happening inside. This is what `torch.compile` actually does.
 

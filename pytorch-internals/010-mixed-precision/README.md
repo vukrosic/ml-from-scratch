@@ -1,7 +1,6 @@
 # Mixed Precision Training From Scratch
 
-> 🔴 YouTube Lesson: Coming soon
-> 🟡 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
+> 🔴 YouTube Lesson: Coming soon | 🟡 Skool Advanced Video Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
 
 Mixed precision cuts your memory footprint in half and speeds up training — but it silently destroys gradients if you do not understand what is happening inside. This is what `torch.cuda.amp` actually does.
 

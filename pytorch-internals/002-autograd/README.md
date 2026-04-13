@@ -1,7 +1,6 @@
 # Autograd From Scratch
 
-> 🔴 YouTube Lesson: Coming soon
-> 🟡 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
+> 🔴 YouTube Lesson: Coming soon | 🟡 Skool Advanced Video Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
 
 When you call `loss.backward()` in PyTorch, gradients appear on every parameter. There is no magic — just two passes and the chain rule. The forward pass records a **tape** of every operation. The backward pass replays that tape in reverse, pushing gradients from the output back to the inputs.
 
