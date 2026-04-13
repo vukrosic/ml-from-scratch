@@ -1,8 +1,11 @@
 # ML From Scratch
 
+> 🎥 YouTube Video: [Watch the torch.compile lesson](https://youtu.be/oO5e9mFFsk4)
+> 🎓 Skool Advanced Lesson: [Become AI Researcher](https://www.skool.com/become-ai-researcher-2669/about)
+
 Learn how deep learning actually works by building everything from scratch in Python. Every tutorial starts from zero — no frameworks, no wrappers — then compares against PyTorch to prove it works.
 
-All code is free and open source. Video walkthroughs on [YouTube](https://youtube.com/@opensuperintelligencelab).
+All code is free and open source. Video walkthroughs on YouTube, with deeper follow-up lessons on Skool.
 
 ## Tutorials
 
@@ -74,5 +77,5 @@ ml-from-scratch/
 
 ## Links
 
-- [YouTube](https://youtube.com/@opensuperintelligencelab) -- free video walkthroughs
-- [Skool](https://www.skool.com/opensuperintelligencelab) -- extended video explanations of the advanced code and deep-dive topics
+- [YouTube](https://youtu.be/oO5e9mFFsk4) -- torch.compile lesson video
+- [Skool](https://www.skool.com/become-ai-researcher-2669/about) -- advanced lesson and deeper follow-up material

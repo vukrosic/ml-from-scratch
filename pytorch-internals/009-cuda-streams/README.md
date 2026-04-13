@@ -1,5 +1,8 @@
 # CUDA Streams From Scratch
 
+> 🎥 YouTube Lesson: Coming soon
+> 🎓 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
+
 Every CUDA kernel you launch goes onto a stream. By default, everything runs on the default stream — and that stream blocks. Custom streams let you run independent operations in parallel, overlap data transfers with computation, and squeeze more utilization out of your GPU. This is what CUDA streams actually do.
 
 ---

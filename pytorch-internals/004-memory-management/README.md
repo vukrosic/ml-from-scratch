@@ -1,5 +1,8 @@
 # GPU Memory Management
 
+> 🎥 YouTube Lesson: Coming soon
+> 🎓 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
+
 CUDA OOM errors don't happen because your model is too big. They happen because you don't know where the memory is going. This lesson gives you the tools to see every byte — and get most of it back.
 
 ---

@@ -1,5 +1,8 @@
 # Attention From Scratch
 
+> 🎥 YouTube Lesson: Coming soon
+> 🎓 Skool Advanced Lesson: [Join the advanced lesson](https://www.skool.com/become-ai-researcher-2669/about)
+
 Every transformer model runs on attention. It is the operation that lets each token look at every other token and decide what matters. It is also the operation that blows up your GPU memory when sequences get long. This tutorial builds attention from the ground up — from the naive O(n²) implementation to Flash Attention's tiling trick that makes long sequences practical — so you understand exactly where the memory goes and how to stop wasting it.
 
 ---
