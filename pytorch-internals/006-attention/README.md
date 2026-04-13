@@ -198,15 +198,29 @@ Autoregressive models must not attend to future positions. A causal mask ensures
 
 ### Causal mask
 
-```
-Causal mask for seq=5:
+The FULL 5×5 causal attention mask (1=attend, 0=masked):
 
-Position 0: [1, 0, 0, 0, 0]   ← can only see itself
-Position 1: [1, 1, 0, 0, 0]   ← can see 0 and 1
-Position 2: [1, 1, 1, 0, 0]
-Position 3: [1, 1, 1, 1, 0]
-Position 4: [1, 1, 1, 1, 1]   ← can see everything
 ```
+                  Key dimension (column)
+                  col0  col1  col2  col3  col4
+                ┌────────────────────────────┐
+         row0   │  1   │  0   │  0   │  0   │  0   │  ← query pos 0: only self
+         row1   │  1   │  1   │  0   │  0   │  0   │  ← query pos 1: 0, 1
+Query     row2   │  1   │  1   │  1   │  0   │  0   │  ← query pos 2: 0, 1, 2
+dimension row3   │  1   │  1   │  1   │  1   │  0   │  ← query pos 3: 0, 1, 2, 3
+(row)     row4   │  1   │  1   │  1   │  1   │  1   │  ← query pos 4: all positions
+                └────────────────────────────┘
+                  ▲
+                  └── diagonal: position i can always attend to itself
+
+Element-wise legend:
+  1 (unmasked): attention score is computed normally, then softmax
+  0 (masked):   attention score is set to -inf before softmax, contributes nothing
+```
+
+The mask is applied before softmax: `scores = scores.masked_fill(mask == 0, float('-inf'))`.
+
+**Why the upper triangle is zero:** For query at position i, key at position j is masked when j > i (future position). The diagonal j == i is always unmasked (a token attends to itself).
 
 ### Naive masking
 
@@ -314,50 +328,59 @@ You need to see ALL values before you can compute any output. This seems to forc
 
 Let us trace through 4 values: [2.0, 4.0, 1.0, 3.0]
 
-```
-Initialize: m = -inf, l = 0  (m = running max, l = running sum of exp)
+**State tracking table** — at each step, m = running max, l = running sum of exp(xi - m):
 
-Process x1 = 2.0:
+```
+Step    Input xi    m (running max)    l (running sum)    softmax so far (xi * l_inv)
+-----------------------------------------------------------------------------------
+init    —           -inf               0                  —
+x1=2.0  2.0         2.0                1.0                softmax(2.0)=1.0/1.0=1.0000  (only x1 known)
+x2=4.0  4.0         4.0                1.1353             softmax(2.0)=0.1353, softmax(4.0)=1.0000
+x3=1.0  1.0         4.0 (unchanged)    1.1851             softmax(2.0)=0.1353, softmax(4.0)=1.0000, softmax(1.0)=0.0498
+x4=3.0  3.0         4.0 (unchanged)    1.5530             softmax(2.0)=0.1353, softmax(4.0)=1.0000, softmax(1.0)=0.0498, softmax(3.0)=0.3679
+```
+
+**Detailed step-by-step update formulas:**
+
+```
+Initialize: m = -inf, l = 0
+
+Step 1 — Process x1 = 2.0:
   m_new = max(-inf, 2.0) = 2.0
-  l     = l × exp(m_old - m_new) + exp(x1 - m_new)
-        = 0 × exp(-inf - 2.0) + exp(2.0 - 2.0)
-        = 0 + exp(0)
-        = 1.0
+  l     = 0 × exp(-inf - 2.0) + exp(2.0 - 2.0)
+        = 0 + exp(0) = 1.0
   m     = 2.0
 
-Process x2 = 4.0:
+Step 2 — Process x2 = 4.0:
   m_new = max(2.0, 4.0) = 4.0
   l     = 1.0 × exp(2.0 - 4.0) + exp(4.0 - 4.0)
-        = 1.0 × exp(-2.0) + exp(0)
-        = 0.1353 + 1.0
-        = 1.1353
+        = 1.0 × 0.1353 + 1.0 = 1.1353
   m     = 4.0
 
-Process x3 = 1.0:
-  m_new = max(4.0, 1.0) = 4.0   ← max unchanged
+Step 3 — Process x3 = 1.0:
+  m_new = max(4.0, 1.0) = 4.0   ← m unchanged
   l     = 1.1353 × exp(4.0 - 4.0) + exp(1.0 - 4.0)
-        = 1.1353 × 1.0 + exp(-3.0)
-        = 1.1353 + 0.0498
-        = 1.1851
+        = 1.1353 × 1.0 + 0.0498 = 1.1851
   m     = 4.0
 
-Process x4 = 3.0:
-  m_new = max(4.0, 3.0) = 4.0   ← max unchanged
+Step 4 — Process x4 = 3.0:
+  m_new = max(4.0, 3.0) = 4.0   ← m unchanged
   l     = 1.1851 × exp(4.0 - 4.0) + exp(3.0 - 4.0)
-        = 1.1851 + 0.3679
-        = 1.5530
+        = 1.1851 + 0.3679 = 1.5530
   m     = 4.0
 
-Final softmax values:
+Final normalization (divide each exp by l):
   softmax(2.0) = exp(2.0 - 4.0) / 1.5530 = 0.1353 / 1.5530 = 0.0871
   softmax(4.0) = exp(4.0 - 4.0) / 1.5530 = 1.0000 / 1.5530 = 0.6439
   softmax(1.0) = exp(1.0 - 4.0) / 1.5530 = 0.0498 / 1.5530 = 0.0321
   softmax(3.0) = exp(3.0 - 4.0) / 1.5530 = 0.3679 / 1.5530 = 0.2369
 
-Verify: 0.0871 + 0.6439 + 0.0321 + 0.2369 = 1.0000 ✓
+Verify sum: 0.0871 + 0.6439 + 0.0321 + 0.2369 = 1.0000 ✓
 ```
 
 The magic: at no point did we need all 4 values in memory simultaneously. We processed them one at a time. Flash Attention applies this same trick to blocks of the attention matrix.
+
+> **Try it yourself:** Run `python flash_attention.py` in this directory to verify this computation matches naive attention.
 
 ### Tiled Computation
 
@@ -404,7 +427,84 @@ Done: O[0:2] now contains the correct output for Q block 0.
 
 The correction step is critical. When the running max changes (because a new K block has larger dot products), all previously accumulated exp() values are too large by a factor of exp(m_old - m_new). The algorithm multiplies the accumulator by this correction factor before adding the new block's contribution.
 
-### Simulating Flash Attention tiling
+### Flash Attention Tiling: 4x4 Matrix Walkthrough with block_size=2
+
+Let us walk through Flash Attention tile by tile on a 4x4 attention matrix with block_size=2 (each block is 2 rows or 2 columns). Q, K, V each have seq=4, d=2 for this example.
+
+```
+Matrix layout (each cell is a scalar score s_ij):
+
+         K dimension
+         col0  col1  col2  col3
+       ┌─────────────────────┐
+  row0 │ s00  s01  s02  s03  │
+  row1 │ s10  s11  s12  s13  │
+Q      │ s20  s21  s22  s23  │
+       │ s30  s31  s32  s33  │
+       └─────────────────────┘
+
+Tiling with block_size=2 splits Q into Q blocks [0:2] and [2:4],
+and K/V into K blocks [0:2] and [2:4].
+```
+
+**Block grid:**
+
+```
+          K block 0    K block 1
+          (cols 0-1)  (cols 2-3)
+         ┌──────────┬──────────┐
+Q block 0 │  Tile    │  Tile    │
+(rows 0-1)│  (0,0)  │  (0,1)  │
+         ├──────────┼──────────┤
+Q block 1 │  Tile    │  Tile    │
+(rows 2-3)│  (1,0)  │  (1,1)  │
+         └──────────┴──────────┘
+```
+
+**Step-by-step execution for Q block 0 (rows 0 and 1):**
+
+```
+Step 1 — Load and compute Tile (0,0):
+  Load Q[0:2]    → Q block 0 (2×d) into SRAM
+  Load K[0:2]    → K block 0 (2×d) into SRAM
+  Load V[0:2]    → V block 0 (2×d) into SRAM
+  Compute S_00 = Q_blk0 @ K_blk0.T   → 2×2 tile in SRAM
+  Online softmax update: update running m_0, m_1, l_0, l_1
+  Accumulate: O[0:2] += softmax(S_00) @ V_blk0
+
+Step 2 — Load and compute Tile (0,1):
+  Q block 0 STAYS in SRAM (never reloaded)
+  Load K[2:4]   → K block 1 (2×d) into SRAM
+  Load V[2:4]   → V block 1 (2×d) into SRAM
+  Compute S_01 = Q_blk0 @ K_blk1.T   → 2×2 tile in SRAM
+  Online softmax correction: rescale previous accumulator using new max
+  Online softmax update: update m_0, m_1, l_0, l_1 with new block
+  Accumulate: O[0:2] += softmax_correction_and_new_block @ V_blk1
+
+Q block 0 is done — O[0:2] now holds the complete correct output.
+Write O[0:2] to HBM. Peak SRAM usage: one 2×2 tile + Q block + K block + V block.
+```
+
+**Step-by-step execution for Q block 1 (rows 2 and 3):** (identical pattern)
+
+```
+Step 3 — Load and compute Tile (1,0):
+  Load Q[2:4]    → Q block 1 (2×d) into SRAM
+  Load K[0:2]    → K block 0 (2×d) into SRAM
+  Load V[0:2]    → V block 0 (2×d) into SRAM
+  Compute S_10 = Q_blk1 @ K_blk0.T
+  Online softmax update
+  Accumulate: O[2:4] += softmax(S_10) @ V_blk0
+
+Step 4 — Load and compute Tile (1,1):
+  Q block 1 STAYS in SRAM
+  Load K[2:4]   → K block 1
+  Compute S_11 = Q_blk1 @ K_blk1.T
+  Correct + update + accumulate
+  Write O[2:4] to HBM
+```
+
+**What never happened:** The full 4×4 attention matrix was never written to HBM. At peak, only one 2×2 tile existed in SRAM. Standard attention would have written 4×4=16 values to HBM; Flash Attention wrote only 4×d=8 values per output row (2 rows × d=2, or 2×4=8 scalars total for this toy example).
 
 ```python
 # flash_attention.py — Piece 5: Flash Attention simulation
@@ -684,6 +784,8 @@ Total: 1 + 1 + 1 + 1 = 4 tokens of K,V work  (O(n))
 
 ### KV cache implementation
 
+Here is the KV cache update step by step with concrete tensor shapes during autoregressive generation. Assume batch=1, d_head=64, and max_len=1024.
+
 ```python
 # kv_cache.py — Piece 8a: KV Cache
 
@@ -721,6 +823,64 @@ class KVCache:
     def reset(self):
         self.keys = None
         self.values = None
+```
+
+**Step-by-step KV cache update with actual sequence lengths:**
+
+```
+Initial state (empty cache, first decoding step):
+  cache.keys = None
+  cache.values = None
+
+Step 1 — First token decoded, k/v computed for position 0:
+  k.shape = (batch=1, new_seq=1, d_head=64)   ← only ONE new position
+  v.shape = (batch=1, new_seq=1, d_head=64)
+
+  cache.keys is None → cache.keys = k
+  cache.values is None → cache.values = v
+
+  AFTER update:
+    cache.keys.shape  = (1, 1, 64)   ← seq_len = 1
+    cache.values.shape = (1, 1, 64)
+
+Step 2 — Second token decoded, k/v computed for position 1:
+  k.shape = (batch=1, new_seq=1, d_head=64)   ← still only the NEW token
+  v.shape = (batch=1, new_seq=1, d_head=64)
+
+  cache.keys exists → torch.cat([cache.keys, k], dim=1)
+  BEFORE concat:
+    cache.keys.shape = (1, 1, 64)   ← cached_seq = 1
+    k.shape          = (1, 1, 64)   ← new_seq = 1
+  AFTER concat (dim=1):
+    combined.shape   = (1, 2, 64)  ← cached_seq + new_seq = 2
+
+  AFTER update:
+    cache.keys.shape  = (1, 2, 64)   ← seq_len = 2
+    cache.values.shape = (1, 2, 64)
+
+Step 3 — Third token decoded:
+  k.shape = (batch=1, new_seq=1, d_head=64)
+  concat → (1, 3, 64)
+
+  AFTER update:
+    cache.keys.shape  = (1, 3, 64)   ← seq_len = 3
+    cache.values.shape = (1, 3, 64)
+
+Step N — Sequence reaches max_len (e.g., max_len=1024, now at step 1025):
+  k.shape = (batch=1, new_seq=1, d_head=64)
+  concat → (1, 1025, 64)
+
+  TRIM triggered because 1025 > max_len:
+    cache.keys = cache.keys[:, -1024:]   ← keep last 1024 positions
+    cache.values = cache.values[:, -1024:]
+
+  AFTER trim:
+    cache.keys.shape  = (1, 1024, 64)   ← back to max_len, oldest token evicted
+    cache.values.shape = (1, 1024, 64)
+
+The Q tensor at every step is shape (batch, 1, d_head) — only the current position.
+The KV cache grows to seq_len = number of decoded tokens (up to max_len).
+This is why decoding cost is O(seq_len) per token, not O(seq_len²).
 ```
 
 ### Benchmark: with and without KV cache
@@ -799,15 +959,11 @@ The online softmax correction involves element-wise operations (exp, multiply, a
 
 ```python
 # PyTorch's SDPA automatically uses Flash Attention 2 when available.
-# You can check which backend is being used:
+# Flash Attention is used automatically via SDPA — no explicit backend selection needed.
+# To verify which kernel is running, use torch.profiler (see ADVANCED.md).
 
-with torch.backends.cuda.sdp_kernel(
-    enable_flash=True,
-    enable_math=False,
-    enable_mem_efficient=False
-):
-    # Forces Flash Attention backend (errors if not available)
-    out = F.scaled_dot_product_attention(Q, K, V)
+# Requirements: PyTorch 2.0+, SM80+ GPU (A100, H100, RTX 3090+),
+# FP16 or BF16 inputs, head dimension <= 256.
 ```
 
 ---
@@ -890,16 +1046,10 @@ out = F.scaled_dot_product_attention(Q, K, V)  # Flash Attention enabled
 ### Mistake 4: Not checking which backend SDPA is using
 
 ```python
-# Debug which backend SDPA selects:
-from torch.nn.attention import SDPBackend, sdpa_kernel
-
-# Check all available backends
-with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-    try:
-        out = F.scaled_dot_product_attention(Q, K, V)
-        print("Flash Attention: available")
-    except RuntimeError as e:
-        print(f"Flash Attention: unavailable ({e})")
+# The SDPA backend selection API changed in PyTorch 2.0.
+# In modern PyTorch, SDPA automatically selects the best backend (Flash Attention
+# if available, else math fallback). You can inspect the selected backend with
+# torch.profiler (see ADVANCED.md for profiling instructions).
 ```
 
 ### Mistake 5: KV cache with wrong sequence dimension
@@ -915,6 +1065,129 @@ cached_K = torch.cat([cached_K, new_K], dim=2)  # dim=2 is seq for (B,H,S,D)
 
 ---
 
+## Common Bugs — Error Messages and Exact Fixes
+
+These are real error messages you will encounter when working with attention, along with their causes and precise fixes.
+
+---
+
+### Bug 1: `RuntimeError: UBLE error: batch size 1 must be less than or equal to 8`
+
+**Cause:** Flash Attention has a minimum batch size requirement on certain hardware configurations. This happens when using `is_causal=True` with batch=1 and very short sequences in some PyTorch versions.
+
+**Fix — use the math fallback explicitly for small batches:**
+
+```python
+from torch.backends.cuda import enable_flash_sdp, enable_math_sdp
+
+# Disable Flash Attention and use math fallback
+enable_flash_sdp(False)
+enable_math_sdp(True)
+
+# Now SDPA uses the math kernel — correct results, no batch size restriction
+out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+
+# Re-enable for production (restore defaults)
+enable_flash_sdp(True)
+enable_math_sdp(False)
+```
+
+Alternatively, ensure you are on PyTorch 2.3+ which fixed this issue for most configurations.
+
+---
+
+### Bug 2: `torch.nn.functional.scaled_dot_product_attention: Expected float16 or bfloat16, got float32`
+
+**Cause:** Flash Attention requires FP16 or BF16 inputs. Using float32 silently falls back to the slow math kernel, or raises this error in strict mode.
+
+**Fix — cast inputs to the correct dtype:**
+
+```python
+# WRONG: float32 — falls back to math kernel silently
+Q = torch.randn(batch, heads, seq, d, dtype=torch.float32, device='cuda')
+K = torch.randn(batch, heads, seq, d, dtype=torch.float32, device='cuda')
+V = torch.randn(batch, heads, seq, d, dtype=torch.float32, device='cuda')
+out = F.scaled_dot_product_attention(Q, K, V)  # slow or error
+
+# RIGHT: bfloat16 — Flash Attention enabled
+Q = torch.randn(batch, heads, seq, d, dtype=torch.bfloat16, device='cuda')
+K = torch.randn(batch, heads, seq, d, dtype=torch.bfloat16, device='cuda')
+V = torch.randn(batch, heads, seq, d, dtype=torch.bfloat16, device='cuda')
+out = F.scaled_dot_product_attention(Q, K, V)  # Flash Attention enabled
+```
+
+---
+
+### Bug 3: `RuntimeError: The shape of mask [seq, seq] at dimension 0 did not match the shape of attn_scores`
+
+**Cause:** The mask tensor has the wrong shape or the wrong dimension ordering. SDPA expects `(batch, num_heads, seq, seq)` when passing a mask tensor, but you may be passing `(seq, seq)` or `(batch, seq, seq)`.
+
+**Fix — reshape the mask to match SDPA's expected layout:**
+
+```python
+# WRONG: 2D mask — wrong shape
+seq = 512
+mask = torch.triu(torch.ones(seq, seq, device='cuda'), diagonal=1).bool()
+out = F.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
+# Error: mask shape [512, 512] does not match attn_scores shape [8, 16, 512, 512]
+
+# RIGHT: reshape mask to (batch, num_heads, seq, seq)
+batch, num_heads, seq, _ = Q.shape  # e.g., (8, 16, 512, 512)
+mask = torch.triu(torch.ones(seq, seq, device='cuda'), diagonal=1).bool()
+mask = mask.unsqueeze(0).unsqueeze(0)           # (1, 1, seq, seq)
+mask = mask.expand(batch, num_heads, -1, -1)    # (batch, num_heads, seq, seq)
+out = F.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
+```
+
+Better yet, use `is_causal=True` which avoids the mask tensor entirely and enables Flash Attention's optimized causal path.
+
+---
+
+### Bug 4: `RuntimeError: KVt must be contiguous in memory. Call .contiguous() before passing to the kernel`
+
+**Cause:** The KV cache tensor has a non-contiguous memory layout (e.g., from a transpose or slice operation). PyTorch SDPA kernels require contiguous tensors.
+
+**Fix — call `.contiguous()` before using the cached KV:**
+
+```python
+# In KVCache.update(), after trim:
+if self.keys.shape[1] > self.max_len:
+    self.keys = self.keys[:, -self.max_len:].contiguous()
+    self.values = self.values[:, -self.max_len:].contiguous()
+
+# In the attention forward pass, before SDPA:
+K_full = K_full.contiguous()   # ensure KV cache is contiguous
+V_full = V_full.contiguous()
+out = F.scaled_dot_product_attention(Q, K_full, V_full, is_causal=True)
+```
+
+---
+
+### Bug 5: `torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate xxx GB` on a 4096-length sequence
+
+**Cause:** Standard attention materializes the full (seq, seq) attention matrix. With float16 and seq=4096: 4096×4096×2 bytes = 32 MB per head, times batch and heads adds up fast. This is the exact OOM scenario Flash Attention is designed to prevent.
+
+**Fix — use Flash Attention via SDPA:**
+
+```python
+import torch.nn.functional as F
+
+Q = torch.randn(batch, heads, seq, d, dtype=torch.bfloat16, device='cuda')
+K = torch.randn(batch, heads, seq, d, dtype=torch.bfloat16, device='cuda')
+V = torch.randn(batch, heads, seq, d, dtype=torch.bfloat16, device='cuda')
+
+# SDPA automatically dispatches to Flash Attention when available
+# (requires SM80+ GPU: A100, H100, RTX 3090+)
+out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+
+# Memory: Flash Attention stores only O(seq) instead of O(seq²)
+# 4096 seq: standard = 32 MB/head, Flash = ~0.5 MB/head (64× savings)
+```
+
+If the OOM persists with Flash Attention, you are likely on an older PyTorch version or the inputs do not meet Flash Attention requirements (head dim > 256, non-FP16 dtype, etc.). Profile with `torch.profiler` to confirm which kernel backend is selected (see ADVANCED.md).
+
+---
+
 ## Recap
 
 | Concept | What It Does | Key Takeaway |
@@ -926,6 +1199,21 @@ cached_K = torch.cat([cached_K, new_K], dim=2)  # dim=2 is seq for (B,H,S,D)
 | Multi-head attention | Run h independent attention heads | Different heads capture different relationship types |
 | KV caching | Cache K,V for previous tokens | Reduces generation from O(n²) to O(n) total compute |
 | SDPA | PyTorch's fused attention API | Automatically picks the best backend for your hardware |
+
+---
+
+## Which File Demonstrates What
+
+This directory contains runnable Python files that demonstrate the concepts covered:
+
+| File | Demonstrates | Related to Piece |
+|------|-------------|-----------------|
+| `attention.py` | Naive attention vs. SDPA benchmark, masking | Pieces 1–4 |
+| `flash_attention.py` | Online softmax walkthrough, simulated tiling | Piece 5 |
+| `multihead.py` | Full multi-head attention module | Piece 7 |
+| `kv_cache.py` | KV cache implementation and generation benchmark | Piece 8 |
+
+Run `python flash_attention.py` in this directory to verify the online softmax computation matches naive attention.
 
 ---
 

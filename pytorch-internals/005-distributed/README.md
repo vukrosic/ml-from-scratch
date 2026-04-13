@@ -76,22 +76,39 @@ Distributed training is built from five primitive operations. Each has specific 
 
 ### all_reduce — Sum Across All Ranks
 
-Every rank has a tensor. After `all_reduce`, every rank has the sum of all tensors:
+Every rank has a tensor. After `all_reduce`, every rank has the sum of all tensors. Here is the exact state before and after with 2 ranks and real values:
 
 ```
-Before:        rank0=[1,2]   rank1=[3,4]
-After all_reduce:  rank0=[4,6]   rank1=[4,6]
+BEFORE all_reduce:
+  rank0 tensor:  [1.0, 2.0]
+  rank1 tensor:  [3.0, 4.0]
+
+all_reduce operation (element-wise sum across all ranks):
+  element 0: 1.0 + 3.0 = 4.0
+  element 1: 2.0 + 4.0 = 6.0
+
+AFTER all_reduce (identical on every rank):
+  rank0 tensor:  [4.0, 6.0]
+  rank1 tensor:  [4.0, 6.0]
 ```
 
-This is how gradient synchronization works. Each rank computes its gradient contribution, then all_reduce sums them so every rank has the identical averaged gradient.
+This is how gradient synchronization works. Each rank computes its gradient contribution, then all_reduce sums them so every rank has the identical averaged gradient. DDP then divides by world size to get the mean.
 
 ### all_gather — Collect Tensors From All Ranks
 
 Every rank contributes a tensor. After `all_gather`, every rank has the concatenation of all tensors:
 
 ```
-Before:        rank0=[1,2]   rank1=[3,4]
-After all_gather:  rank0=[1,2,3,4]   rank1=[1,2,3,4]
+BEFORE all_gather:
+  rank0 tensor:  [1.0, 2.0]
+  rank1 tensor:  [3.0, 4.0]
+
+all_gather operation (concatenate along rank dimension):
+  result: [rank0 tensor, rank1 tensor] = [1.0, 2.0, 3.0, 4.0]
+
+AFTER all_gather (identical on every rank):
+  rank0 tensor:  [1.0, 2.0, 3.0, 4.0]
+  rank1 tensor:  [1.0, 2.0, 3.0, 4.0]
 ```
 
 This appears in pipeline parallelism when a later stage needs the full input.
@@ -101,8 +118,13 @@ This appears in pipeline parallelism when a later stage needs the full input.
 One rank has a tensor. After `broadcast`, all ranks have a copy:
 
 ```
-Before:        rank0=[1,2]   rank1=[?,?]  (rank1 has garbage)
-After broadcast from rank0:  rank0=[1,2]   rank1=[1,2]
+BEFORE broadcast from rank0:
+  rank0 tensor:  [1.0, 2.0]
+  rank1 tensor:  [?, ?]   (uninitialized or garbage)
+
+AFTER broadcast from rank0 (rank0 is the source):
+  rank0 tensor:  [1.0, 2.0]   (unchanged — it was the source)
+  rank1 tensor:  [1.0, 2.0]   (now matches rank0)
 ```
 
 Used to distribute model parameters or configuration from rank 0 to everyone else.
@@ -112,15 +134,36 @@ Used to distribute model parameters or configuration from rank 0 to everyone els
 Every rank contributes a tensor. After `reduce`, only the root rank has the sum:
 
 ```
-Before:        rank0=[1,2]   rank1=[3,4]
-After reduce to rank0:  rank0=[4,6]   rank1=[?,?] (unchanged)
+BEFORE reduce to rank0:
+  rank0 tensor:  [1.0, 2.0]
+  rank1 tensor:  [3.0, 4.0]
+
+reduce operation (element-wise sum, delivered only to rank0):
+  element 0: 1.0 + 3.0 = 4.0
+  element 1: 2.0 + 4.0 = 6.0
+
+AFTER reduce to rank0:
+  rank0 tensor:  [4.0, 6.0]   (contains the aggregated sum)
+  rank1 tensor:  [3.0, 4.0]   (unchanged — no data received)
 ```
 
 Useful when only one rank needs the aggregated result — saves communication for non-essential ranks.
 
 ### barrier — Synchronization Point
 
-Every rank waits until all ranks have arrived. Not a data movement operation — it only synchronizes. Useful for timing sections of code across ranks.
+Every rank waits until all ranks have arrived. Not a data movement operation — it only synchronizes. Useful for timing sections of code across ranks:
+
+```
+rank0: does work  →  barrier  →  does more work
+rank1: does work  →  barrier  →  does more work
+rank2: does work  →  barrier  →  does more work
+        ↑                    ↑
+  All ranks wait here   All ranks wait here
+  until everyone        until everyone
+  arrives                arrives
+```
+
+No tensors are exchanged — only a synchronization signal.
 
 ---
 
@@ -164,6 +207,94 @@ divide by 2:     [3.0, 5.0]  ← same on every rank
 
 Without DDP, each rank would apply its own local gradient and the models would diverge.
 
+### Gradient Sync Verification: Correct vs Incorrect with 2 Ranks
+
+Use `all_gather` to collect each rank's local gradient and compare them element-wise. Here is what correct synchronization looks like versus a bug where synchronization was skipped.
+
+**Setup**: Suppose we have a single parameter with gradient tensor `[g0, g1]` on each rank. There is a bug in the code (e.g., DDP was not wrapped correctly, or `optimizer.zero_grad()` was called after backward but before the sync).
+
+**Step-by-step verification code:**
+
+```python
+import torch.distributed as dist
+
+# Assume model is a DDP-wrapped model
+for name, param in model.named_parameters():
+    if param.grad is None:
+        continue  # skip parameters without gradients
+
+    # Clone the local gradient — we will gather it from all ranks
+    local_grad = param.grad.clone()          # shape: (param_size,)
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    # Prepare output buffer — one slot per rank
+    all_grads = [torch.zeros_like(local_grad) for _ in range(world_size)]
+
+    # Collect local gradients from every rank into all_grads
+    # After this call, all ranks have the same list of tensors
+    dist.all_gather(all_grads, local_grad)
+
+    # Compare all ranks to rank 0's gradient
+    if rank == 0:
+        rank0_grad = all_grads[0].cpu().numpy()
+
+        for r in range(1, world_size):
+            rank_r_grad = all_grads[r].cpu().numpy()
+
+            if torch.allclose(rank0_grad, rank_r_grad, rtol=1e-5, atol=1e-5):
+                print(f"{name}: SYNC OK — all ranks have identical gradients")
+                print(f"  rank0 grad: {rank0_grad}")
+                print(f"  rank{r} grad: {rank_r_grad}")
+            else:
+                print(f"{name}: SYNC MISMATCH — rank 0 and rank {r} differ!")
+                print(f"  rank0 grad: {rank0_grad}")
+                print(f"  rank{r} grad: {rank_r_grad}")
+                print(f"  diff: {rank0_grad - rank_r_grad}")
+```
+
+**Correct behavior — DDP properly wrapping the model:**
+
+```
+BEFORE backward():
+  rank0 grad:  uninitialized
+  rank1 grad:  uninitialized
+
+AFTER loss.backward() (DDP hooks fire automatically):
+  rank0 local grad:  [2.0, 4.0]   (computed from batch_slice_0)
+  rank1 local grad:  [4.0, 6.0]   (computed from batch_slice_1)
+
+DDP all_reduce happens here (automatic, triggered by backward hooks):
+  rank0 receives: [4.0, 6.0] from rank1
+  rank1 receives: [2.0, 4.0] from rank0
+  Both compute: (local + received) / 2
+
+AFTER DDP sync (param.grad is now the averaged gradient on EVERY rank):
+  rank0 param.grad:  [3.0, 5.0]   ← averaged
+  rank1 param.grad:  [3.0, 5.0]   ← identical
+  Verification output: "fc1.weight: SYNC OK — all ranks have identical gradients"
+```
+
+**Incorrect behavior — no DDP wrapper, or zero_grad called after backward:**
+
+```
+rank0 local grad:  [2.0, 4.0]   (computed from batch_slice_0)
+rank1 local grad:  [4.0, 6.0]   (computed from batch_slice_1)
+
+NO synchronization — each rank keeps its own local gradient.
+
+rank0 param.grad:  [2.0, 4.0]   ← NOT averaged
+rank1 param.grad:  [4.0, 6.0]   ← NOT averaged
+  Verification output: "fc1.weight: SYNC MISMATCH — rank 0 and rank 1 differ!"
+  diff: [-2.0, -2.0]
+
+Consequence: optimizer.step() updates rank0 and rank1 with different
+parameters. After one step, the models have diverged. After N steps,
+they are completely different models — DDP training is broken.
+```
+
+The mismatch is a clear signal that gradient synchronization is not happening. Common causes: wrapping with `DDP` after moving to GPU but not using `device_ids`, calling `optimizer.zero_grad()` between `backward()` and `step()`, or using `DataParallel` instead of `DDP`.
+
 ---
 
 ## torchrun: The Standard Launcher
@@ -189,6 +320,51 @@ torchrun --nproc_per_node=2 --nnodes=2 --node_rank=1 --master_addr=192.168.1.100
 ```
 
 The `--master_addr` must be reachable from all nodes. Usually the first node's IP address.
+
+### torchrun Flags: Exactly What Each One Sets
+
+Each flag directly maps to an environment variable that PyTorch reads:
+
+```
+--nproc_per_node=2
+  Sets: WORLD_SIZE=2
+  Meaning: Total number of processes across the entire run.
+           With 2 GPUs per node and 2 nodes, WORLD_SIZE=4.
+
+--nnodes=2
+  Sets: WORLD_SIZE (recomputed as nproc_per_node × nnodes)
+  Meaning: Total number of compute nodes participating in the job.
+
+--node_rank=0
+  Sets: NODE_RANK=0
+  Meaning: Which node this process is running on.
+           Node 0 is typically the master node (hosts master_addr).
+
+--master_addr=192.168.1.100
+  Sets: MASTER_ADDR=192.168.1.100
+  Meaning: IP address of the "master" node.
+           All processes connect to this address to find each other.
+           Must be reachable from every node (use IP, not hostname).
+
+--master_port=29500
+  Sets: MASTER_PORT=29500
+  Meaning: TCP port on master_addr used for initial process discovery.
+           Must be free on the master node. Use a different port if 29500 is busy.
+```
+
+Environment variables torchrun sets automatically (you do not set these yourself):
+
+| Env Variable | Set By | Meaning |
+|---|---|---|
+| `RANK` | torchrun | Global rank of this process (0 to WORLD_SIZE-1) |
+| `LOCAL_RANK` | torchrun | Local rank within this node (0 to nproc_per_node-1) |
+| `WORLD_SIZE` | torchrun | Total number of processes |
+| `LOCAL_WORLD_SIZE` | torchrun | Number of processes on this node |
+| `NODE_RANK` | torchrun | Index of the current node |
+| `MASTER_ADDR` | torchrun (or --master_addr) | IP of the master node |
+| `MASTER_PORT` | torchrun (or --master_port) | Port on master node for rendezvous |
+
+Your script reads these via `dist.get_rank()`, `dist.get_world_size()`, etc. — you never import or set them directly.
 
 ---
 
@@ -251,20 +427,46 @@ model = DDP(model, device_ids=[rank])
 
 ### Piece 4: Training loop
 
+Here is every line of the DDP training loop explained step by step:
+
 ```python
 optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 
 for inputs, targets in dataloader:
-    # DDP handles gradient synchronization
+    # Step 1: Move this rank's batch slice to its GPU.
+    # Each rank has a different slice of the data — rank 0 gets batch_slice_0,
+    # rank 1 gets batch_slice_1, etc.
     inputs = inputs.cuda(rank)
+
+    # Step 2: Move the corresponding targets to the same GPU.
+    # Targets must be on the same device as the inputs for cross_entropy.
     targets = targets.cuda(rank)
 
+    # Step 3: Clear stale gradients from the previous step.
+    # Without this, new gradients would accumulate on top of old ones.
     optimizer.zero_grad()
+
+    # Step 4: Forward pass — only this rank's slice of the batch is used.
+    # The model is a DDP-wrapped copy; gradients produced here are local.
     output = model(inputs)
+
+    # Step 5: Compute loss between predictions and this rank's targets.
+    # The loss is also local — it only reflects this rank's data.
     loss = nn.functional.cross_entropy(output, targets)
+
+    # Step 6: Backward pass — fills .grad on each parameter with LOCAL gradients.
+    # At this point, grad on rank 0 differs from grad on rank 1.
+    # DDP hooks detect this and schedule async all_reduce across all ranks.
     loss.backward()
+
+    # Step 7: DDP all_reduce completes here (or earlier, async).
+    # Every rank now has IDENTICAL gradients — the average of all local grads.
+    # Step 8: Optimizer uses these identical gradients to update parameters.
+    # All ranks make the same weight updates, staying in sync.
     optimizer.step()
 ```
+
+The key insight: steps 1-6 are purely local computation. Step 7 (gradient sync) is the only collective communication, and it happens exactly once per training step, after all compute is finished.
 
 ### Piece 5: Launch
 
@@ -293,7 +495,7 @@ PyTorch also has `DataParallel` (DP). It is simpler but slower:
 | Multi-GPU | All GPUs compute | One GPU coordinates |
 | Multi-node | Works | Does not work |
 
-DDP communicates less, uses memory more efficiently, and scales to multiple nodes. With NCCL on two GPUs, DDP typically achieves ~1.8x speedup vs single GPU for compute-bound workloads. Always prefer DDP.
+DDP communicates less, uses memory more efficiently, and scales to multiple nodes. With NCCL on two GPUs, DDP typically achieves ~1.8x speedup vs single GPU for compute-bound workloads. Measured on 2x A100, per the benchmark in ADVANCED.md. Always prefer DDP.
 
 ---
 
@@ -305,6 +507,17 @@ DDP communicates less, uses memory more efficiently, and scales to multiple node
 - **DDP:** Every rank has a full model copy. After backward, gradients are all_reduced so all ranks have identical averaged gradients before the optimizer step.
 - **torchrun:** Launches processes, sets environment variables, handles cleanup. Use `--nproc_per_node` to control GPU count.
 - **Scaling:** DDP scales near-linearly (~Nx speedup on N GPUs) for compute-bound workloads. Small models or slow interconnects bottleneck on communication.
+
+---
+
+## Which File to Run For What
+
+| File | What It Demonstrates |
+|------|----------------------|
+| `ddp.py` | End-to-end DDP training with torchrun — gradient sync, multi-GPU training loop |
+| `all_reduce.py` | Manual all_reduce gradient averaging — shows the mechanics behind DDP |
+| `collective_ops.py` | All five collective ops (all_reduce, all_gather, broadcast, reduce, barrier) with timing |
+| `init.py` | Different init methods (env://, tcp://, file://) and how torchrun sets up environment |
 
 ---
 

@@ -81,6 +81,77 @@ Each tuple is `(output_name, operation, input_names)`. When Dynamo encounters so
 
 Dynamo is correct first. If it cannot trace something, it breaks rather than silently producing wrong results. (https://pytorch.org/tutorials/intermediate/torch_compile_tutorial.html)
 
+### A Concrete Walkthrough: `x @ W` Through All Three Stages
+
+Here is exactly what happens to a single `x @ W` operation as it travels through the pipeline.
+
+**Starting code:**
+
+```python
+h = x @ W1          # one matmul in Python
+h = torch.relu(h)   # one relu in Python
+```
+
+**Step 1 — TorchDynamo traces bytecode**
+
+Dynamo intercepts the Python bytecode for `x @ W1`. It records:
+
+```
+('t3', 'matmul', ['x', 'w1'])
+```
+
+`x` and `w1` are the input tensor names. `t3` is the output name Dynamo assigns. Then it intercepts the bytecode for `relu(t3)`:
+
+```
+('t4', 'relu', ['t3'])
+```
+
+The full Dynamo output for this two-op sequence:
+
+```
+('t3', 'matmul', ['x', 'w1'])
+('t4', 'relu',   ['t3'])
+```
+
+**What Dynamo cannot trace** — anything that requires reading an actual tensor *value* to proceed. For example, `if x.sum() > 0` asks a question whose answer depends on data. Dynamo cannot know the answer at trace time, so it breaks the graph there.
+
+**Step 2 — AOT Autograd captures backward**
+
+PyTorch's autograd engine normally computes gradients on the fly during training. That live computation would undo fusion — the backward pass would re-introduce all the gaps that forward fusion removed.
+
+AOT Autograd runs the forward pass internally to observe it, builds the backward graph, and packages both as a joint graph:
+
+```
+Joint graph:
+  Forward:  ('t3', 'matmul', ['x', 'w1'])  →  ('t4', 'relu', ['t3'])
+  Backward: ('t6', 'relu_backward', ['t4'])  →  ('t7', 'matmul_backward', ['t3', 'w1'])
+```
+
+The backward pass is now also compiled. In training mode, both forward and backward run as fused kernels.
+
+**Step 3 — TorchInductor generates Triton kernel**
+
+Inductor receives the joint graph and emits one Triton kernel that computes both forward and backward together. Instead of launching separate kernels for matmul and relu, the GPU executes one fused kernel:
+
+```triton
+@triton.jit
+def kernel(x_ptr, w1_ptr, grad_out_ptr, out_ptr, h_ptr):
+    # --- Forward pass ---
+    x  = tl.load(x_ptr)          # load input x from DRAM → register
+    t3 = x @ w1                   # matmul: register → register (no memory write)
+    t4 = t3 * tl.sigmoid(t3) * 1.702  # GELU approximation: register → register
+    tl.store(out_ptr, t4)         # store final output to DRAM
+
+    # --- Backward pass (fused into same kernel) ---
+    grad_t4 = tl.load(grad_out_ptr)   # upstream gradient
+    grad_t3 = grad_t4 * (t4 * (1 - t4) * 1.702)  # relu backward
+    # ... weight gradients computed and stored ...
+```
+
+**What to watch for:** The key win is that `t3` (the matmul output) is never written to DRAM. It stays in a register and the GELU reads it directly. Without fusion, there would be a `tl.store` + `tl.load` pair between matmul and GELU — that memory round-trip costs ~nanoseconds but compounds over thousands of layers.
+
+**Why this matters:** Fusion does not just combine operations — it eliminates the memory hierarchy entirely for intermediate results. The GPU never waits for a memory fetch between fused ops.
+
 ### Stage 2: AOT Autograd Captures the Backward Pass
 
 PyTorch normally computes gradients on the fly during training. That live computation would defeat fusion — the backward pass would re-introduce all the gaps that the forward fusion eliminated.
@@ -131,6 +202,105 @@ Your Python model
 Fused GPU kernel
 ```
 
+## Timeline Visualization: One `torch.compile(model)(x)` Call
+
+Here is the complete call sequence from `torch.compile(model)(x)` through all three stages, with timing annotations. This is what happens on the **first call only** — subsequent calls skip directly to the fused kernel.
+
+```
+torch.compile(model)(x)
+│
+│  Step 1: torch.compile() returns a callable wrapper (instant, no work yet)
+│  Time: ~0 ms
+│
+└── First call: compiled_model(x)
+    │
+    │  ════════════════════════════════════════════════
+    │  STEP 1: TorchDynamo traces bytecode
+    │  ════════════════════════════════════════════════
+    │  Time: ~100-500 ms (model-dependent)
+    │  
+    │  Python bytecode interpreter is hooked.
+    │  Each operation records its input/output names.
+    │  Produces: FX graph (list of op tuples)
+    │
+    │  Example FX graph for one layer:
+    │    ('t3', 'matmul', ['x', 'w1'])
+    │    ('t4', 'relu',   ['t3'])
+    │    ('t5', 'matmul', ['t4', 'w2'])
+    │
+    │  If Dynamo hits something untraceable → graph break.
+    │  Each break starts a new graph segment.
+    │
+    │  ════════════════════════════════════════════════
+    │  STEP 2: AOT Autograd captures backward pass
+    │  ════════════════════════════════════════════════
+    │  Time: ~100-500 ms (additional)
+    │  
+    │  Runs forward pass internally to observe it.
+    │  Captures backward graph (gradients for each op).
+    │  Packages forward + backward as a joint graph.
+    │
+    │  Joint graph structure:
+    │    Forward:  matmul → relu → matmul
+    │    Backward: matmul_grad ← relu_grad ← matmul_grad
+    │
+    │  ════════════════════════════════════════════════
+    │  STEP 3: TorchInductor generates Triton kernel
+    │  ════════════════════════════════════════════════
+    │  Time: ~500-2000 ms (kernel compilation is the slowest step)
+    │  
+    │  Receives the joint graph.
+    │  Applies fusion: adjacent matmul+relu → one kernel.
+    │  Generates Triton Python code (or C++ for CPU).
+    │  Triton JIT compiles the kernel to PTX/SASS.
+    │  Result: one fused GPU kernel handles forward+backward.
+    │
+    │  Fused kernel structure:
+    │    tl.load(x)          → load input
+    │    x @ w1              → matmul 1 (register-to-register)
+    │    relu(x @ w1)        → GELU 1   (register-to-register)
+    │    ...                 → matmul 2 + GELU 2 (fused)
+    │    tl.store(out)       → store result
+    │
+    │  ════════════════════════════════════════════════
+    │  KERNEL EXECUTION: first compiled forward pass
+    │  ════════════════════════════════════════════════
+    │  Time: ~Z ms (same as eager — this IS the first call)
+    │
+    │  The compiled kernel runs once.
+    │  This first run IS slow — compilation happened inside it.
+    │
+    │  ════════════════════════════════════════════════
+    │  COMPILED MODEL CACHED
+    │  ════════════════════════════════════════════════
+    │
+    └── Subsequent calls (call 2, 3, 4, ...):
+        │
+        │  No compilation. TorchDynamo sees the same graph.
+        │  Cached kernel is replayed directly.
+        │
+        |  ════════════════════════════════════════════════
+        |  KERNEL EXECUTION: steady-state compiled calls
+        |  ════════════════════════════════════════════════
+        |  Time: ~Z ms per call (fused, no compilation overhead)
+        |
+        |  All 4 ops (2× matmul, 2× GELU) run as ONE kernel.
+        |  Zero memory round-trips between ops.
+        |  Speedup compounds over thousands of calls.
+```
+
+**Timeline on a single call — what you actually see:**
+
+```
+Call 1 (compile):  |---Dynamo---|---AOT---│---Inductor---|---kernel run---|
+                   ~100-500ms   ~100-500ms  ~500-2000ms      ~Z ms
+
+Call 2+ (cached): |---kernel run---|---kernel run---|---kernel run---|
+                   ~Z ms each       ~Z ms each       ~Z ms each
+```
+
+**The key insight:** Call 1 pays ALL compilation costs: Dynamo tracing + AOT capture + Inductor code generation + Triton compilation. This is why the first call takes 1-3 seconds for large models. But that cost is paid once and amortized over every subsequent call. For a model running 10,000 training steps, the compilation cost is a one-time 2-second stall, not a per-step penalty.
+
 ---
 
 ## What Graph Breaks Actually Are
@@ -157,14 +327,49 @@ print(f"Graph breaks: {explain_output.graph_break_count}")
 print(f"Graphs:       {explain_output.graph_count}")
 ```
 
-Example output for a model with one graph break:
+The output object has two fields you need:
+
+- `graph_break_count` — how many times Dynamo was forced to break
+- `graph_count` — how many separate compiled graphs Dynamo produced
+
+**BEFORE: BadModule with `.item()` graph break**
+
+```python
+class BadModule(nn.Module):
+    def forward(self, x):
+        if x.sum().item() > 0:   # .item() forces Python fallback — graph break
+            return x * 2
+        return x - 2
+```
+
+Running `dynamo.explain(BadModule())(x)`:
 
 ```
 Graph breaks: 1
 Graphs:       2
 ```
 
-Dynamo produced 2 separate compiled graphs instead of 1 — because one piece of code could not be traced. Each graph is a separate GPU kernel launch.
+**What this means:** Dynamo produced 2 separate compiled graphs instead of 1. The `.item()` call forced it to stop tracing, run that piece in Python, then start a new graph afterward. Two graphs means two separate GPU kernel launches.
+
+**AFTER: FixedModule with no graph breaks**
+
+```python
+class FixedModule(nn.Module):
+    def forward(self, x):
+        cond = (x.sum() > 0)         # stays as a tensor — no break
+        return torch.where(cond, x * 2, x - 2)
+```
+
+Running `dynamo.explain(FixedModule())(x)`:
+
+```
+Graph breaks: 0
+Graphs:       1
+```
+
+One graph — fully compiled, fully fused. The entire forward pass runs as one GPU kernel.
+
+**Why this matters:** Each graph break fragments fusion. A model with 5 breaks produces up to 6 separate kernels. Those kernels cannot share data in registers — intermediate results must be written to DRAM and reloaded, which reintroduces the gaps that compilation eliminates.
 
 Three common triggers:
 
@@ -330,25 +535,61 @@ TorchInductor does this in hardware — it scans the graph for adjacent compatib
 
 From an optimized graph, we can generate real Python code that uses torch operations. TorchInductor generates Triton kernel code; we generate torch Python. The idea is the same: turn the graph back into runnable code.
 
+### The Input Graph (after fusion)
+
+Fusion turned our raw trace into this:
+
+```
+('t4', 'fused_matmul_relu', ['x', 'w1'])    # matmul+relu merged into one op
+('t5', 'matmul', ['t4', 'w2'])              # second matmul (no relu after it)
+```
+
+### Step-by-Step Transformation
+
+The `codegen` function processes each node in order:
+
 ```python
 def codegen(graph, fn_name="compiled_fn"):
-    lines = [f"def {fn_name}(x, w1, w2):"]
+    lines = [f"def {fn_name}(x, w1, w2):"]    # Step 1: emit function signature
 
-    for out, op, args in graph:
+    for out, op, args in graph:               # Step 2: iterate over each node
         if op == "fused_matmul_relu":
+            # Step 3a: fused node becomes torch.relu(matmul)
+            # args[0] = 'x', args[1] = 'w1'
             lines.append(f"    {out} = torch.relu({args[0]} @ {args[1]})")
         elif op == "matmul":
+            # Step 3b: matmul becomes plain @ operator
+            # args[0] = 't4', args[1] = 'w2'
             lines.append(f"    {out} = {args[0]} @ {args[1]}")
         elif op == "relu":
             lines.append(f"    {out} = torch.relu({args[0]})")
         elif op == "add":
             lines.append(f"    {out} = {args[0]} + {args[1]}")
 
-    lines.append(f"    return {graph[-1][0]}")
+    lines.append(f"    return {graph[-1][0]}") # Step 4: return last output name
     return "\n".join(lines)
 ```
 
-Running codegen on the fused graph produces:
+Walking through each node:
+
+**Node 1: `('t4', 'fused_matmul_relu', ['x', 'w1'])`**
+- `op == "fused_matmul_relu"` is True
+- `args[0]` = `'x'`, `args[1]` = `'w1'`
+- Output line: `    t4 = torch.relu(x @ w1)`
+
+**Node 2: `('t5', 'matmul', ['t4', 'w2'])`**
+- `op == "matmul"` is True, `op == "fused_matmul_relu"` is False
+- `args[0]` = `'t4'`, `args[1]` = `'w2'`
+- Output line: `    t5 = t4 @ w2`
+
+**Final return: `graph[-1][0]`**
+- `graph[-1]` = `('t5', 'matmul', ['t4', 'w2'])`
+- `graph[-1][0]` = `'t5'`
+- Output line: `    return t5`
+
+### The Output
+
+Running `codegen` on the fused graph produces:
 
 ```
 def compiled_fn(x, w1, w2):
@@ -357,7 +598,23 @@ def compiled_fn(x, w1, w2):
     return t5
 ```
 
-This is real runnable Python — it is what TorchInductor produces in hardware as a Triton kernel.
+This is real runnable Python — it is what TorchInductor produces in hardware as a Triton kernel. Each line corresponds to one node in the graph. `t4 = torch.relu(x @ w1)` runs the fused matmul+relu in a single GPU kernel. `t5 = t4 @ w2` runs the second matmul in its own kernel.
+
+### What TorchInductor does differently
+
+Inductor starts from the same graph but instead of emitting Python, it emits Triton:
+
+```python
+# Inductor's equivalent of the above, in Triton:
+@triton.jit
+def kernel(in_ptr, w1_ptr, w2_ptr, out_ptr):
+    x   = tl.load(in_ptr + offs)
+    t4  = tl.relu(x @ w1)         # fused_matmul_relu in hardware
+    t5  = t4 @ w2                  # second matmul
+    tl.store(out_ptr + offs, t5)
+```
+
+The structure is identical — the operations are the same, the data flow is the same. Only the runtime target changed: from Python `torch.relu` to Triton `tl.relu`.
 
 ---
 
@@ -471,22 +728,65 @@ This function measures milliseconds per step after warmup. It handles the GPU sy
 import time
 
 def benchmark(fn, x, steps=200, warmup=50):
-    # Warmup runs the model without timing
-    # This ensures the compiled graph is cached
+    # Step 1: Warmup — run the model without timing
+    # This ensures the compiled graph is cached.
+    # torch.compile defers compilation until the first call.
+    # Running it 'warmup' times establishes the cached kernel.
     for _ in range(warmup):
         fn(x)
 
-    # Synchronize before timing — GPU calls are asynchronous
-    # Without this, we measure Python overhead, not GPU execution
+    # Step 2: Synchronize before timing — GPU calls are asynchronous
+    # When Python calls a CUDA kernel, it returns immediately.
+    # The GPU is still running. Without synchronize() here,
+    # time.perf_counter() captures Python overhead, not GPU time.
     torch.cuda.synchronize()
 
+    # Step 3: Time the steady-state calls
+    # 'steps' samples give an average, reducing variance from GPU
+    # clock frequency changes, kernel launch overhead, etc.
     t0 = time.perf_counter()
     for _ in range(steps):
         fn(x)
 
-    # Synchronize again to get the true end time
+    # Step 4: Synchronize again to get the true end time
+    # This blocks until the GPU finishes all 'steps' kernel launches.
+    # Without this, 't0' and 'time.perf_counter()' at the end
+    # would both be measured in Python time, not GPU time.
     torch.cuda.synchronize()
+
+    # Step 5: Divide by steps to get average ms per call
+    # 'time.perf_counter() - t0' is the total for all steps.
+    # Dividing by 'steps' gives the per-call average.
     return (time.perf_counter() - t0) / steps
+```
+
+**What to watch for:**
+
+- **Without warmup:** On the first call, `torch.compile` pays the compilation cost (often 1000+ ms). Your timing would be completely wrong.
+- **Without synchronize (before):** `t0` is set while the GPU is still running warmup kernels. You measure Python time, not GPU time.
+- **Without synchronize (after):** The loop has finished returning to Python but the GPU is still executing. You get a too-small elapsed time.
+- **Why divide by steps:** Single calls have high variance from kernel launch overhead. Averaging over 200 steps smooths this.
+
+**What warmup does — timeline:**
+
+```
+| warmup[0] | warmup[1] | ... warmup[49] | [==== timed loop: 200 calls ====] |
+   GPU running,                   GPU idle now        GPU running again
+   results discarded             ready to time       timing starts here
+```
+
+**Why synchronize matters — timeline:**
+
+```
+Without synchronize:
+  CPU:  |---fn()---|---fn()---|---fn()---|   (Python returns fast, GPU lagging)
+  GPU:    |---kernel---||---kernel---||---kernel---|  (actual work)
+
+With synchronize:
+  CPU:  |---fn()---|---fn()---|---fn()---|  (Python returns fast)
+  GPU:    |---kernel---||---kernel---||---kernel---|
+  CPU:  synchronize blocks here until GPU is done ↑
+  t0 captured at this point — true GPU time
 ```
 
 Run the full benchmark:
@@ -603,6 +903,21 @@ One graph — fully compiled, fully fused.
 - **Synchronize before measuring.** GPU calls are asynchronous.
 - **`.item()` in a forward pass causes graph breaks.** Use `torch.where` instead.
 - **`torch.compile` increases VRAM usage.** Budget extra memory in GPU-constrained environments.
+
+---
+
+## Which File Does What
+
+| File | What it demonstrates |
+|------|----------------------|
+| `benchmark.py` | Eager vs compiled on a 4-layer MLP — produces the three timing numbers |
+| `benchmark_modes.py` | All four `torch.compile` modes across five batch sizes |
+| `profile_architectures.py` | Five architectures benchmarked: MLP, CNN, Transformer, Attention, UNet |
+| `graph_breaks.py` | BadModule vs FixedModule — shows the `.item()` break and its fix |
+| `graph_break_scanner.py` | Automated scanner that finds breaks and suggests fixes |
+| `tracer.py` | Toy tracer — builds an FX graph from operations |
+| `fusion.py` | Toy fusion pass — merges adjacent matmul+relu into one op |
+| `codegen.py` | Generates Python from a graph (reverse of tracing) |
 
 ---
 

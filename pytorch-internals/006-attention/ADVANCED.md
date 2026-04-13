@@ -81,6 +81,11 @@ Memory stored: O(N) — only the output and logsumexp for backward pass
 
 ### The IO Complexity Proof (Theorem from Dao et al.)
 
+> **Intuition**: the attention output depends on all N² entries of QK^T.
+> SRAM fits M elements. Each pass over the SRAM processes at most M entries.
+> To see all N² entries, you need ~N²/M passes, each reading O(d) elements from HBM.
+> Total HBM reads: O(N² · d / M) — much less than O(N²) of naive attention.
+
 **Theorem**: Any exact attention algorithm that computes the N x N attention matrix must make at least Omega(N^2 * d^2 / M) HBM accesses, where M is SRAM size.
 
 **Proof sketch**:
@@ -468,6 +473,7 @@ Length      (tokens/s)            (tokens/s)
 ### Memory Usage Comparison (Forward Pass, per Layer)
 
 ```
+Hardware: A100 80GB
 Sequence    Standard Attention    Flash Attention 2    Reduction
 Length      Memory                Memory
 --------    ------------------    -----------------    ---------
@@ -503,6 +509,44 @@ torch.backends.cuda.enable_math_sdp(True)           # Naive math fallback
 ```
 
 Requirements: SM80+ GPU (A100, H100, RTX 3090+), head dim <= 256, FP16 or BF16 inputs. Use `torch.profiler` with `ProfilerActivity.CUDA` to verify which kernel backend is selected at runtime.
+
+---
+
+## How to Profile Attention to See Which Kernel Runs
+
+Use `torch.profiler` to inspect which SDPA backend is actually dispatched at runtime.
+
+```python
+import torch
+import torch.nn.functional as F
+from torch.profiler import profile, ProfilerActivity
+
+# Enable CUDA profiling
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    record_shapes=True,
+    with_stack=True,
+) as prof:
+    Q = torch.randn(2, 8, 512, 64, dtype=torch.bfloat16, device='cuda')
+    K = torch.randn(2, 8, 512, 64, dtype=torch.bfloat16, device='cuda')
+    V = torch.randn(2, 8, 512, 64, dtype=torch.bfloat16, device='cuda')
+    out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+
+# Print the profiled CUDA kernels
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+```
+
+What to look for in the output:
+- **flash_attention** or **flash**: Flash Attention 2 kernel is running
+- **mem_efficient_attention**: xFormers memory-efficient kernel (older, slower than flash)
+- **aten::scaled_dot_product_attention**: Math fallback (naive implementation)
+- **void flash**: Raw CUDA kernel names
+
+If you see only "aten::scaled_dot_product_attention" with large cuda_time, SDPA is likely falling back to the math kernel. Common causes:
+- Inputs are float32 (Flash requires FP16/BF16)
+- Head dimension > 256
+- CUDA architecture < SM80 (older GPUs)
+- attn_mask tensor being passed instead of is_causal=True
 
 ---
 

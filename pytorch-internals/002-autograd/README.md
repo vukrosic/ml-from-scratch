@@ -184,14 +184,41 @@ The gradients **accumulate** rather than reset. Each `backward()` call propagate
 
 ```python
 a = Value(2.0, label="a")
-b = a * a
-b.backward()   # a.grad = 2 * a = 4.0
-b.backward()   # a.grad = 4.0 + 4.0 = 8.0  (accumulates!)
+b = a * a        # b = 4.0, b.grad_fn knows: a.grad += a.data * b.grad = 2.0 * 1.0
+b.backward()     # a.grad = 2.0 * 1.0 = 2.0  (one pass)
+b.backward()     # a.grad = 2.0 + 2.0 = 4.0  (accumulates!)
+```
+
+Trace through with actual numbers:
+
+```
+First backward():
+  b.grad = 1.0  (seed)
+  b._backward(): a.grad += a.data * b.grad = 2.0 * 1.0 = 2.0
+  Result: a.grad = 2.0
+
+Second backward() (no reset!):
+  b.grad = 1.0  (seed again — no reset between calls)
+  b._backward(): a.grad += a.data * b.grad = 2.0 * 1.0 = 2.0
+  Result: a.grad = 2.0 + 2.0 = 4.0  (accumulated!)
 ```
 
 In PyTorch this is the same — `optimizer.step()` does not clear gradients; you must call `optimizer.zero_grad()` explicitly. This design choice exists because **gradient accumulation** is a real technique: when a GPU cannot fit a large batch, you run several small batches and accumulate gradients before stepping.
 
 To reset gradients to zero before a second pass, re-create the Value objects. The old nodes have no way to know they should reset.
+
+> **Try It Yourself**
+> ```python
+> a = Value(2.0, label="a")
+> b = a * a
+> b.backward()
+> print(f"After 1st backward: a.grad = {a.grad}")   # 4.0
+> b.backward()
+> print(f"After 2nd backward: a.grad = {a.grad}")   # 8.0 (accumulated!)
+> # To reset: a = Value(2.0, label="a"); b = a * a; b.backward()
+> ```
+
+
 
 ---
 
@@ -245,7 +272,30 @@ def _backward():
 ```
 This closure is called during `backward()`. It takes the gradient that has flowed into `out` and passes it straight through to both inputs. For addition, the local derivative is 1, so each input gets `1 * out.grad = out.grad`.
 
-Concrete example: if `out.grad = 0.7` (meaning the loss changes by 0.7 when `out` changes by 1), then both `a.grad` and `b.grad` get `+= 0.7`.
+Concrete example with ACTUAL numbers — `a = 3.0`, `b = 5.0`, `out = 8.0`:
+
+```
+Forward:
+  a.data = 3.0
+  b.data = 5.0
+  out.data = a.data + b.data = 3.0 + 5.0 = 8.0
+```
+
+```
+Backward (say out.grad = 1.0, meaning d(loss)/d(out) = 1.0):
+  Step 1: out._backward() is called
+  Step 2: self.grad += out.grad   →   a.grad += 1.0   →   a.grad = 1.0
+  Step 3: other.grad += out.grad  →   b.grad += 1.0   →   b.grad = 1.0
+```
+
+That is all. Since `d(out)/d(a) = 1` and `d(out)/d(b) = 1`, the gradient passes straight through unchanged.
+
+What if `out.grad = 0.4` instead?
+```
+  a.grad += 0.4   →   a.grad = 0.4
+  b.grad += 0.4   →   b.grad = 0.4
+```
+The upstream gradient `0.4` flows unchanged because the local derivative is `1`.
 
 ```python
 out._backward = _backward
@@ -253,19 +303,34 @@ return out
 ```
 Attach the backward function to the output node and return it.
 
+---
+
 **Why `+=` and not `=`?** If a Value is used in multiple places (e.g., `a + a`), its gradient must **accumulate** contributions from every path. Using `=` would overwrite the first contribution:
 
 ```
-a + a:
-  path 1: a is left input  → a.grad += out.grad    (first contribution)
-  path 2: a is right input → a.grad += out.grad    (second contribution)
-  total: a.grad = 2 * out.grad                      (correct: d(a+a)/da = 2)
+a + a (with a = 3.0, out = 6.0, out.grad = 1.0):
 
-If we used = instead of +=:
-  path 1: a.grad = out.grad     (set to out.grad)
-  path 2: a.grad = out.grad     (overwrites — still out.grad)
-  total: a.grad = out.grad                           (wrong: should be 2*out.grad)
+With += (correct):
+  path 1: a is left input  → a.grad += out.grad    →   a.grad = 1.0
+  path 2: a is right input → a.grad += out.grad    →   a.grad = 2.0
+  total: a.grad = 2.0  (correct: d(a+a)/da = 2)
+
+With = (wrong):
+  path 1: a.grad = out.grad     →   a.grad = 1.0
+  path 2: a.grad = out.grad     →   a.grad = 1.0  (overwrites!)
+  total: a.grad = 1.0  (wrong: should be 2)
 ```
+
+> **Try It Yourself**
+> ```python
+> a = Value(3.0, label="a")
+> c = a + a
+> print(f"out = {c.data}")   # 6.0
+> c.backward()
+> print(f"a.grad = {a.grad}")  # 2.0 — two contributions of 1.0 each
+> ```
+
+
 
 ### Multiplication
 
@@ -304,17 +369,54 @@ other.grad += self.data  * out.grad
 ```
 Same logic, swapped: the gradient for `other` uses `self.data` as the local derivative.
 
-Concrete example with `a=3.0, b=5.0`:
+Concrete example with ACTUAL numbers — `a = 3.0`, `b = 5.0`, `out = 15.0`:
 
 ```
-Forward:  out = a * b = 3.0 * 5.0 = 15.0
-
-Backward (say out.grad = 0.4):
-  a.grad += b.data * out.grad = 5.0 * 0.4 = 2.0
-  b.grad += a.data * out.grad = 3.0 * 0.4 = 1.2
+Forward:
+  a.data = 3.0
+  b.data = 5.0
+  out.data = a.data * b.data = 3.0 * 5.0 = 15.0
 ```
 
-Why `out.grad` and not just the local derivative? Because `out.grad` carries `d(loss)/d(out)` — the gradient from everything downstream. We multiply it by `d(out)/d(a)` to get `d(loss)/d(a)`. This is the chain rule chaining through the entire graph.
+```
+Backward (say out.grad = 1.0, meaning d(loss)/d(out) = 1.0):
+
+  Step 1: out._backward() is called
+
+  Step 2: self.grad += other.data * out.grad
+          → a.grad += b.data * out.grad
+          → a.grad += 5.0 * 1.0
+          → a.grad = 5.0
+
+  Step 3: other.grad += self.data * out.grad
+          → b.grad += a.data * out.grad
+          → b.grad += 3.0 * 1.0
+          → b.grad = 3.0
+```
+
+The local derivative `d(out)/d(a) = b = 5.0`. Multiply by upstream gradient `out.grad = 1.0` gives `a.grad = 5.0`. Same for `b`.
+
+What if `out.grad = 0.4` instead?
+
+```
+  a.grad += 5.0 * 0.4 = 2.0
+  b.grad += 3.0 * 0.4 = 1.2
+```
+
+The chain rule in plain English: "the gradient of `a` equals the gradient flowing into `out`, multiplied by how much `out` changes when `a` changes." `out` changes 5 times as fast as `a` (because `out = a * 5`), so the upstream gradient `0.4` gets scaled by `5` to give `2.0`.
+
+> **Try It Yourself**
+> ```python
+> a = Value(3.0, label="a")
+> b = Value(5.0, label="b")
+> c = a * b
+> print(f"out = {c.data}")   # 15.0
+> c.backward()
+> print(f"a.grad = {a.grad}")  # 5.0 — b's value times upstream grad
+> print(f"b.grad = {b.grad}")  # 3.0 — a's value times upstream grad
+> ```
+
+
 
 ---
 
@@ -361,6 +463,18 @@ Example 2 — negative input:
 
 This is why "dead neurons" happen in ReLU networks — once a neuron's input is always negative, its gradient is always zero, so it never updates.
 
+> **Try It Yourself**
+> ```python
+> pos = Value(3.0, label="pos")
+> neg = Value(-2.0, label="neg")
+> pos_relu = pos.relu()    # 3.0 — positive passes through
+> neg_relu = neg.relu()   # 0.0 — negative killed
+> pos_relu.backward()
+> neg_relu.backward()
+> print(f"pos.grad = {pos.grad}")   # 1.0 — gradient flowed through
+> print(f"neg.grad = {neg.grad}")   # 0.0 — gradient was killed
+> ```
+
 ### Tanh
 
 `tanh(x)` squashes values to the range `[-1, 1]`. Its derivative is `1 - tanh(x)^2`.
@@ -403,6 +517,18 @@ Example — large input:
   self.data = 5.0  →  t = tanh(5.0) ≈ 0.9999
   derivative = 1 - 0.9999^2 ≈ 0.0002              (almost no gradient passes through)
 ```
+
+> **Try It Yourself**
+> ```python
+> small = Value(0.5, label="small")
+> large = Value(5.0, label="large")
+> small_tanh = small.tanh()
+> large_tanh = large.tanh()
+> small_tanh.backward()
+> large_tanh.backward()
+> print(f"small gradient: {small.grad:.4f}")   # ~0.786 — most gradient passes
+> print(f"large gradient: {large.grad:.6f}")  # ~0.0002 — vanishing gradient!
+> ```
 
 ---
 
@@ -454,6 +580,73 @@ def build_order(v):
     order.append(v)
 ```
 Recursive depth-first traversal. For each node: mark it visited, recurse into all its inputs first, then append self. This puts inputs before outputs in `order` — so when we reverse it, outputs come first.
+
+---
+
+**Tracing the recursion on a tiny 3-node graph:**
+
+Consider: `c = a + b`
+
+```
+Graph:    a  →  c ←  b
+       (leaf)    (leaf)
+```
+
+`build_order(c)` is called. Here is exactly what happens, step by step:
+
+```
+CALL 1: build_order(c)
+  v = c, visited = {}
+  Is c in visited? No.
+  visited.add(c)    → visited = {c}
+  Loop over c._prev = (a, b):
+    CALL 1a: build_order(a)
+      v = a, visited = {c}
+      Is a in visited? No.
+      visited.add(a)    → visited = {c, a}
+      Loop over a._prev = ():  (a is a leaf, nothing to recurse)
+      order.append(a)    → order = [a]
+      RETURN from 1a
+
+    CALL 1b: build_order(b)
+      v = b, visited = {c, a}
+      Is b in visited? No.
+      visited.add(b)    → visited = {c, a, b}
+      Loop over b._prev = ():  (b is a leaf, nothing to recurse)
+      order.append(b)    → order = [a, b]
+      RETURN from 1b
+
+  order.append(c)    → order = [a, b, c]
+  RETURN from CALL 1
+```
+
+Final: `order = [a, b, c]`. Then `reversed(order) = [c, b, a]` — outputs before inputs, exactly what backward needs.
+
+For a deeper graph `d = (a + b) * c`:
+
+```
+  build_order(d)
+  → build_order(a)     → order = [a]
+  → build_order(b)     → order = [a, b]
+  → order.append(+)    → order = [a, b, +]        ← the + node
+  → build_order(c)     → order = [a, b, +, c]
+  → order.append(*)    → order = [a, b, +, c, *]  ← the * node (d)
+  reversed: [d, c, +, b, a]
+```
+
+Each recursive call processes a node only after all its inputs have been processed. The `visited` set prevents infinite loops when a node is used in multiple places.
+
+> **Try It Yourself**
+> ```python
+> a = Value(2.0, label="a")
+> b = Value(3.0, label="b")
+> c = a + b
+> d = c * a
+> # Manually trace build_order(d): what order do you get?
+> # Answer: [a, b, +, c, *] → reversed: [*, c, +, b, a]
+> ```
+
+
 
 ```python
 build_order(self)

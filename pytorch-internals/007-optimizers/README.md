@@ -341,7 +341,60 @@ adamw_losses = train_with_optimizer(
 )
 ```
 
-Run `compare.py` to see the loss curves for all three.
+Run `python compare.py` to generate loss curves comparing all three optimizers. The script runs two experiments: a simple 1D problem (minimizing `(w - 5)^2`) and an MLP regression task on synthetic data. Two PNG files are saved: `optimizer_comparison.png` (1D problem) and `optimizer_comparison_mlp.png` (MLP regression).
+
+#### What the PNG curves look like
+
+**optimizer_comparison.png (1D problem):**
+
+```
+Loss
+  ^
+  |  SGD: slow start, steady descent
+  |  Adam: fast initial drop
+25|****
+  |    ****  AdamW: slightly above Adam (weight decay opposes target=5)
+  |        ****
+  |             ****
+  |                 ****
+  |                      ****
+  +------------------------------------> Step
+  0    20    40    60    80   100
+```
+
+- SGD (orange dashed): starts at loss=25, descends slowly but steadily. Reaches ~0.01 by step 100.
+- Adam (blue): drops to near-zero by step 20, fastest early convergence.
+- AdamW (green): slightly above Adam throughout due to weight decay actively shrinking w toward 0 (opposite of target=5).
+
+**optimizer_comparison_mlp.png (MLP regression):**
+
+```
+Loss
+  ^
+  |  SGD: lower final loss (better generalization)
+  |  Adam/AdamW: lower initial loss
+  |___________________
+  |         ****      SGD
+  |      ****         Adam
+  |   ****            AdamW
+  +------------------------------------> Step
+```
+
+- Adam/AdamW drop quickly initially but plateau higher.
+- SGD with momentum takes longer to get going but settles to a lower final loss — the signature generalization advantage of SGD on structured tasks.
+
+---
+
+## Which File Demonstrates What
+
+| File | What it demonstrates |
+|------|----------------------|
+| `sgd.py` | SGD with momentum implementation — manual velocity accumulation, step-by-step trace of weight, loss, and velocity values |
+| `adam.py` | Adam implementation — manual first and second moment updates with bias correction, per-step trace of `m_hat` and `v_hat` |
+| `adamw.py` | AdamW implementation — Adam update plus a separate decoupled weight decay step, showing how the two operations are kept independent |
+| `compare.py` | Side-by-side comparison of all three optimizers — runs both a 1D toy problem and an MLP regression task, plots loss curves, saves PNG outputs |
+
+Run any file directly with `python <filename>.py`. Each prints per-step diagnostics and returns the loss history.
 
 ---
 

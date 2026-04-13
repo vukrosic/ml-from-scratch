@@ -322,6 +322,22 @@ def hooked_backward():
 node._backward = hooked_backward
 ```
 
+> **Try It Yourself**
+> ```python
+> # In PyTorch, attach a hook that doubles the gradient
+> x = torch.tensor([2.0], requires_grad=True)
+> y = x * x
+> y.backward()
+> print(x.grad)    # tensor([4.])
+>
+> # With hook that doubles it:
+> x2 = torch.tensor([2.0], requires_grad=True)
+> x2.register_hook(lambda g: g * 2)
+> y2 = x2 * x2
+> y2.backward()
+> print(x2.grad)   # tensor([8.]) — doubled by the hook
+> ```
+
 ---
 
 ## Custom Autograd Functions
@@ -394,6 +410,25 @@ When would you write a custom Function? When you have an operation that:
 - PyTorch cannot differentiate automatically (custom CUDA kernels, numerical methods)
 - You know a more memory-efficient or numerically stable backward than autograd would produce
 - You want to fuse forward and backward into a single efficient kernel
+
+> **Try It Yourself**
+> ```python
+> class MySin(torch.autograd.Function):
+>     @staticmethod
+>     def forward(ctx, x):
+>         ctx.save_for_backward(x)
+>         return x.sin()
+>
+>     @staticmethod
+>     def backward(ctx, grad_output):
+>         x, = ctx.saved_tensors
+>         return grad_output * x.cos()   # d(sin)/dx = cos
+>
+> x = torch.tensor([0.5], requires_grad=True)
+> y = MySin.apply(x)
+> y.backward()
+> print(x.grad)   # cos(0.5) ≈ 0.8776
+> ```
 
 ---
 
@@ -664,6 +699,19 @@ def _backward():
 
 Then calling `backward()` on the gradient *itself* would replay *that* tape. The backward pass becomes a forward pass — you need a tape of the backward pass to differentiate through it. PyTorch handles this with `create_graph=True` in `torch.autograd.grad`.
 
+> **Try It Yourself**
+> ```python
+> # First derivative: dy/dx at x = 2.0, y = x^3
+> x = torch.tensor([2.0], requires_grad=True)
+> y = x ** 3
+> dy_dx = torch.autograd.grad(y, x, create_graph=True)[0]
+> print(f"dy/dx = {dy_dx}")        # tensor([12.]) — correct: 3 * 2^2 = 12
+>
+> # Second derivative: d^2y/dx^2
+> d2y_dx2 = torch.autograd.grad(dy_dx, x)[0]
+> print(f"d2y/dx2 = {d2y_dx2}")   # tensor([12.]) — correct: 6 * 2 = 12
+> ```
+
 ---
 
 ## Memory: Where Autograd Bytes Go
@@ -716,7 +764,66 @@ Checkpointed (low memory):
 
 Memory drops from O(n) to O(sqrt(n)) layers. The cost: each non-checkpointed layer is computed twice — once in forward, once in backward.
 
-In PyTorch:
+### Manual checkpointing in our engine
+
+Here is how to manually implement checkpointing on a simple 3-layer computation:
+
+```python
+class CheckpointedLayer:
+    def __init__(self, weight):
+        self.weight = weight
+
+    def forward(self, x):
+        # Non-checkpointed: stores x for backward
+        return x * self.weight
+
+    def backward(self, grad_out):
+        # Gradients flow through stored x
+        return grad_out * self.weight
+```
+
+With manual checkpointing, you explicitly decide what to save and what to recompute:
+
+```python
+# Forward pass — save only checkpoints
+x1 = layer1.forward(x0)         # compute and DISCARD x0
+x2 = layer2.forward(x1)         # compute and DISCARD x1 — save only x2
+x3 = layer3.forward(x2)         # compute and DISCARD x2 — save only x3 (loss input)
+
+# During backward, recompute missing activations from checkpoints
+x2_recomputed = recompute(layer2, x1)  # recreate x1's output from x1 input
+x1_recomputed = recompute(layer1, x0)  # recreate x0's output from x0 input
+
+# Now compute gradients using the recomputed values
+grad_x2 = x3._prev[0].grad           # already computed
+grad_x1 = layer2.backward(grad_x2)   # uses x2_recomputed
+grad_x0 = layer1.backward(grad_x1)   # uses x1_recomputed
+```
+
+### Step-by-step: Forward and Backward with Checkpointing
+
+Consider a 3-layer network: `y = W3(W2(W1(x)))`. Here is exactly what happens:
+
+```
+Forward pass:
+  Step 1: a1 = W1 @ x          — compute and STORE x (checkpoint)
+  Step 2: a2 = W2 @ a1        — compute and DISCARD a1 (checkpoint only a2)
+  Step 3: a3 = W3 @ a2        — compute and DISCARD a2
+  Step 4: loss = loss(a3)    — loss is the final output
+
+Backward pass:
+  Step 1: loss.grad = 1.0
+  Step 2: grad_a3 = d(loss)/d(a3) — known from loss backward
+  Step 3: grad_a2 = W3.T @ grad_a3 — uses stored W3, computes grad to a2
+  Step 4: RECOMPUTE a2 from a1 (saved checkpoint) — forward pass through W2
+  Step 5: grad_a1 = W2.T @ grad_a2 — uses recomputed a2, computes grad to a1
+  Step 6: RECOMPUTE a1 from x  (saved checkpoint) — forward pass through W1
+          grad_x   = W1.T @ grad_a1 — uses recomputed a1
+```
+
+The key insight: you trade **memory** (storing all activations) for **compute** (re-running forward passes during backward). In practice, this means you save activations at layers 1, 3, 5, ... (every sqrt(n) layers) and recompute the rest.
+
+### In PyTorch:
 
 ```python
 from torch.utils.checkpoint import checkpoint
@@ -724,6 +831,27 @@ from torch.utils.checkpoint import checkpoint
 # Instead of:  y = self.block(x)
 # Use:         y = checkpoint(self.block, x, use_reentrant=False)
 ```
+
+`checkpoint` wraps a function and:
+1. Runs the forward pass, saving only at specified intervals
+2. During backward, recomputes the dropped activations on-the-fly
+3. Returns the same result as the non-checkpointed version
+
+`use_reentrant=False` is required for correct gradient handling in modern PyTorch.
+
+> **Try It Yourself**
+> ```python
+> # Manually trace checkpointing on a tiny example
+> # Layer 1: y1 = w1 * x
+> # Layer 2: y2 = w2 * y1
+> # Layer 3: y3 = w3 * y2
+> #
+> # Full forward: stores y1, y2, y3 (3 activations)
+> # Checkpointed (save y1, y3 only):
+> #   forward: saves y1, y3; recomputes y2 during backward
+> #   memory saved: 1 activation
+> #   compute cost: +1 recompute per backward
+> ```
 
 Our tiny engine has no memory pressure — everything is a single float. But the principle is the same: you can drop intermediate values and recompute them from checkpoints.
 

@@ -21,11 +21,21 @@ result2 = y @ x      # waits for result1 to finish
 
 The GPU executes each operation in order on a single stream. Operation 2 cannot start until operation 1 completes — even if the GPU has free resources that could handle both.
 
+**Timeline with annotated timing:**
+
 ```
-Default stream:
-| matmul | waited | matmul |
-|<- A ->|  gap    |<- B  ->|
+Default stream timeline (all on Stream 0):
+|............ matmul A ............|.5ms gap.|............ matmul B ............|
+|<--------- 5 ms --------->|        |        |<--------- 5 ms --------->|
+                               ↑                  ↑
+                          GPU gap:            matmul B
+                          GPU idle            cannot start until
+                                             matmul A finishes
+
+Total wall-clock time: 5ms + 0.5ms + 5ms = 10.5 ms
 ```
+
+The 0.5ms gap is the hardware context-switch time as the GPU switches between kernels. Even though matmul B is completely independent of matmul A, it must wait.
 
 ### The Fix: Custom Streams Run Independently
 
@@ -38,13 +48,24 @@ with torch.cuda.stream(stream):
     result2 = y @ x    # runs on stream, does not wait for result1
 ```
 
+**Same two matmuls on different streams with overlapping timeline:**
+
 ```
-Stream 0 (default):  | matmul A |
-Stream 1 (custom):   | matmul B |
-                      ↑ runs concurrently, no waiting
+Stream 0 (default):  |............ matmul A ............|
+Stream 1 (custom):   |..... matmul B (starts immediately) .....|
+
+Timeline:
+|<----------------- 5 ms total (overlapped) ----------------->|
+
+matmul A:  ████████████████████████████████████████  (5 ms)
+matmul B:  ████████████████████████████████  (5 ms)
+           |--- starts at 0 ms (no waiting) ---|
+
+Total wall-clock time: ~5 ms (vs 10.5 ms sequential)
+Speedup: ~2x
 ```
 
-Both kernels launch without waiting for each other. The GPU schedules them as hardware allows.
+Both kernels launch without waiting for each other. The GPU schedules them as hardware allows — the second matmul starts immediately even though the first one is still running.
 
 ---
 
@@ -138,7 +159,39 @@ event.wait()
 final = result + bias
 ```
 
-This is how you synchronize across streams without blocking the whole GPU.
+**Step-by-step what `record()` and `wait()` do:**
+
+```
+Step 1: event.record() is called inside stream
+        - Captures stream's current position counter
+        - event.timestamp = stream_position_counter (e.g., 42)
+        - event is now "attached" to stream at this position
+
+        Stream (custom): |...... matmul ......| event_record@42 |
+                                                      ^
+                                                 event stored here
+
+Step 2: event.wait() is called from default stream
+        - default stream notes: "before doing my next op,
+          wait until stream reaches position 42"
+        - default stream does NOT block here, it continues
+
+        Default stream: | previous ops | event_wait() | final = result + bias |
+                                                      ↑
+                                              inserts dependency:
+                                              "don't proceed past here
+                                              until event@42 is reached"
+
+Step 3: GPU scheduler
+        - custom stream executes matmul, reaches position 42
+        - marks event as COMPLETED
+        - default stream is now unblocked and can proceed
+
+Result: final = result + bias only runs AFTER matmul on stream is done
+        But default stream could run OTHER ops before reaching this point
+```
+
+This is how you synchronize across streams without blocking the whole GPU. The default stream can still do independent work — it only blocks at the specific `event.wait()` point.
 
 ### synchronize() — Block Until a Stream Finishes
 
@@ -153,6 +206,41 @@ stream.synchronize()
 
 # Safe to use `result` now — stream is done
 print(result.sum())
+```
+
+### stream.synchronize() vs event.wait(): The Key Difference
+
+These two primitives have fundamentally different effects on the CPU and GPU:
+
+```
+stream.synchronize() — BLOCKS THE CPU THREAD
+
+    CPU thread:  |........ do stuff .......|**** blocked ****|.. continue ..|
+                                       ↑
+                              CPU waits here until
+                              the ENTIRE stream finishes
+
+    All streams continue running during this time — the GPU is not
+    paused. Only this CPU thread is blocked, waiting for the stream
+    to complete.
+
+event.wait() — BLOCKS A SPECIFIC STREAM (not the CPU)
+
+    Default stream:  |.. ops ..| event_wait() | subsequent ops |
+                                          ↑
+                                  This stream pauses here.
+                                  Other ops on this stream that come
+                                  AFTER event_wait() must wait.
+
+    Custom stream:    |.. matmul ..| [event recorded here]
+
+    Key difference: The CPU thread continues immediately after calling
+    event.wait(). Only the default stream's execution is deferred at
+    the event.wait() point. Other CPU work can proceed.
+
+Summary:
+    stream.synchronize()  → CPU thread waits. All GPU streams keep going.
+    event.wait()          → One specific stream waits. CPU is not blocked.
 ```
 
 ### Events — Measure Time and Sync Points
@@ -221,14 +309,30 @@ with torch.cuda.stream(transfer_stream):
 next_input.synchronize()
 ```
 
+**Timeline with annotated timing:**
+
 ```
-Time:        |--- compute on batch N ---|--- compute on batch N+1 ---|
-Compute:     |████ model forward ████|
-Transfer:              |--- load next batch -->|--- transfer to GPU -->|
-             |<-- batch N idle -->|
+Sequential (naive) — NO overlap:
+Time (ms):    |0........10........20........30........40|
+Transfer:     |--- transfer --|-- gap --|-- transfer --|
+Compute:                           |--- compute ---|
+              ↑ total: ~40 ms (transfer + compute sequential)
+
+Overlapped (two streams):
+Time (ms):    |0........10........20........30|
+Compute:      |████ matmul+relu+matmul ████|
+Transfer:              |--- next batch transfer -->|
+                                   ↑         ↑
+                               transfer   compute
+                               overlaps   on next
+                               compute   batch starts
+                               here      here
+
+              |<---- ~25 ms total ---->|
+              Savings: ~15 ms (37.5% reduction)
 ```
 
-The compute and transfer streams run concurrently. The CPU prepares the next batch while the GPU processes the current one.
+The key insight: while the GPU is running matmul+relu+matmul on batch N (compute stream), the transfer stream is simultaneously moving batch N+1 from CPU to GPU. The CPU-side preparation of batch N+1 also happens concurrently with GPU compute. The compute and transfer streams run concurrently. The CPU prepares the next batch while the GPU processes the current one.
 
 ### The Template
 
@@ -288,6 +392,8 @@ torch.cuda.synchronize()   # wait for kernel to finish
 end = time.perf_counter()
 print(end - start)        # actual GPU time
 ```
+
+> **Key rule: CUDA operations are asynchronous. Always call `torch.cuda.synchronize()` before timing or the measurement includes Python overhead, not GPU time.**
 
 ### Profiling with Events
 
@@ -387,6 +493,8 @@ with torch.cuda.stream(compute_stream):
 compute_stream.synchronize()
 ```
 
+The full runnable version of this example is in `streams.py`. Run it with `python streams.py`.
+
 ---
 
 ## Recap
@@ -399,6 +507,16 @@ compute_stream.synchronize()
 - **Events measure GPU time accurately.** Use `torch.cuda.Event(enable_timing=True)` for precise profiling.
 - **Overlap transfers and compute** by running them on different streams simultaneously.
 - **The CPU never waits for the GPU.** GPU operations return immediately — synchronization is explicit.
+
+---
+
+## Which File Demonstrates What
+
+| File | What It Demonstrates |
+|------|----------------------|
+| `streams.py` | Default stream vs custom stream benchmark — sequential vs concurrent matmuls, profiler output |
+| `event_sync.py` | CUDA event timing, cross-stream synchronization with `event.wait()` |
+| `overlap.py` | Overlapping data transfer and computation across two streams, realistic pipeline |
 
 ---
 

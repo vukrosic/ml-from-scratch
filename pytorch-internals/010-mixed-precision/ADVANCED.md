@@ -6,6 +6,10 @@ This file contains numerical results and convergence analysis for mixed precisio
 
 ## FP16 vs BF16 Convergence
 
+**Hardware: GTX 1070 Ti** (Turing, no Tensor Cores for FP16 — uses FP32 paths with FP16 emulation)
+
+**Note: All numbers are placeholders. Run `python convergence.py` on your GPU to get real measurements.**
+
 Run `convergence.py` to generate loss curves. The script trains a 4-layer MLP on a synthetic dataset in three modes: FP32 (baseline), FP16 with GradScaler, and BF16 with GradScaler.
 
 Expected behavior:
@@ -19,6 +23,10 @@ The key metric is the gap between FP16/BF16 and FP32 at the end of training. A l
 ---
 
 ## GradScaler Recovery
+
+**Hardware: GTX 1070 Ti**
+
+**Note: All numbers are placeholders. Run `python grad_scaler.py` on your GPU to get real measurements.**
 
 Run `grad_scaler.py` to measure what GradScaler actually recovers. The script:
 
@@ -34,6 +42,12 @@ The optimal scale factor is dynamic — GradScaler adjusts it automatically base
 ---
 
 ## TF32 Speed vs FP32 on Ampere+
+
+**Hardware: GTX 1070 Ti**
+
+**Note: All numbers are placeholders. Run `python tf32.py` on your GPU to get real measurements.**
+
+**GTX 1070 Ti vs A100 on TF32:** The GTX 1070 Ti is a Turing-generation GPU. Turing supports FP16 Tensor Cores but does **not** have the dedicated TF32 format that Ampere+ GPUs expose via `torch.set_float32_matmul_precision("high")`. On Ampere+ (A100, H100, RTX 3090/4090), TF32 is a native format that Tensor Cores accelerate — yielding 2-4x matmul speedup over FP32. On GTX 1070 Ti, the precision setting has no effect because TF32 is not supported; matmuls run in true FP32 or fall back to FP16 paths. Benchmark numbers on this hardware will differ significantly from published A100 results.
 
 Run `tf32.py` to measure TF32 speedup. The script benchmarks matrix multiplication throughput with and without TF32 enabled.
 

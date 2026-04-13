@@ -71,18 +71,63 @@ Here is the benchmark function that produces those three numbers. This is what `
 
 ```python
 def benchmark(fn, x, steps=200, warmup=50):
-    # Warmup runs the model without timing
-    # This establishes the cached compiled graph
+    # Step 1: Warmup — run fn(x) 'warmup' times without timing.
+    # torch.compile defers compilation to the first call.
+    # Running warmup times establishes the cached compiled kernel.
+    # The compiled graph is now ready for fast replay.
     for _ in range(warmup):
         fn(x)
+
+    # Step 2: Synchronize — GPU calls are asynchronous.
+    # Python returns immediately when a CUDA kernel is launched.
+    # The GPU is still running the warmup kernels.
+    # synchronize() blocks until all GPU work is finished.
+    # Without this, the timer would start while GPU is still warmup.
     torch.cuda.synchronize()
 
-    # Now time the steady-state calls
+    # Step 3: Start timing — capture the CPU clock before the loop.
     t0 = time.perf_counter()
+
+    # Step 4: Run 'steps' iterations of the model.
+    # Each call to fn(x) replays the cached compiled kernel.
+    # No compilation happens here — just fast kernel replay.
     for _ in range(steps):
         fn(x)
+
+    # Step 5: Synchronize again — block until GPU finishes all steps.
+    # Without this, the end time is measured while GPU is still running.
+    # You would get a too-small elapsed time.
     torch.cuda.synchronize()
+
+    # Step 6: Return average milliseconds per call.
+    # (time.perf_counter() - t0) is total seconds for all 'steps'.
+    # Dividing by 'steps' gives per-call average.
+    # Multiplying by 1000 converts seconds → milliseconds.
     return (time.perf_counter() - t0) / steps
+```
+
+**What to watch for:**
+
+- **Why warmup matters:** The first compiled call always pays the full compilation cost (Dynamo tracing + AOT capture + Inductor compilation). If you time that first call, your measurement includes 1000+ ms of compilation overhead. Warmup establishes the cache so timing only measures steady-state kernel execution.
+- **Why two synchronize calls:** GPU operations are queued asynchronously. Without synchronize before timing, `t0` is set while the GPU is still running warmup work. Without synchronize after the loop, `time.perf_counter()` is called while the GPU is still running the timed loop. Both sync points are required for accurate measurement.
+- **Why divide by steps:** A single kernel call has variance from GPU clock throttling, kernel launch overhead, and cache effects. Averaging over 200 steps smooths noise and gives a reliable per-call estimate.
+- **What the warmup loop actually does on GPU:**
+
+```
+GPU timeline for warmup loop:
+| warmup[0] (cached kernel) | warmup[1] (cached) | ... | warmup[49] (cached) |
+      GPU running                    GPU running                 GPU done
+      results discarded             results discarded            ready to time
+```
+
+- **What the timed loop does on GPU:**
+
+```
+GPU timeline for timed loop:
+| call[0] | call[1] | call[2] | ... | call[199] |
+  ~Z ms     ~Z ms     ~Z ms            ~Z ms
+  GPU runs all in a stream, results discarded
+  CPU measures wall-clock time for all 200 calls
 ```
 
 What that looks like on a timeline:
@@ -164,7 +209,239 @@ def kernel(in_ptr, out_ptr, W1, W2, ...):
     tl.store(out_ptr + offs, h)
 ```
 
+**Variable Glossary**
+- `pid = tl.program_id(0)` = block index along the batch*head dimension
+- `offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)` = row offsets into the tile
+- `BLOCK_M` = tile size in rows (controls how many rows each thread block processes)
+- `tl.load(in_ptr + offs)` = load a tile from DRAM into SRAM
+- `tl.store(out_ptr + offs, h)` = store result from SRAM back to DRAM
+- `tl.arange(n)` = range `[0, n)` used to compute element positions within a tile
+
 Without fusion, this would be four separate kernel launches. The fused version keeps values in registers between ops — no memory round-trips. Reading a few of these files is the fastest way to understand what fusion actually buys you.
+
+### Step-by-Step: One Iteration of the Fused Kernel Inner Loop
+
+This section walks through exactly what happens in registers during one iteration of the fused MLP kernel. We track concrete values for a single output element.
+
+**Setup:** Suppose we are computing the fused kernel for the first layer of the MLP:
+- Input tile `x` has shape `(BLOCK_M, 1024)` — loaded into registers
+- Weight `W1` has shape `(1024, 4096)` — also in registers/shared memory
+- BLOCK_M = 128 (128 rows per thread block)
+
+**Register state at start of iteration:**
+
+```
+Register r_x  : holds one row of input: x[i]     (shape: 1024,)
+Register r_W1 : holds weight matrix tile          (shape: 1024, 4096)
+Register r_h  : empty (will hold matmul result)
+Register r_g  : empty (will hold GELU result)
+```
+
+**Step 1 — tl.load: Load input tile from DRAM → registers**
+
+```python
+offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)   # offs = [0, 1, 2, ..., 127] for pid=0
+x = tl.load(in_ptr + offs)                     # x[i] loaded for each thread i
+```
+
+After this step:
+```
+Register r_x[i] : holds x[i] for thread i's row
+SRAM tile x_tile is now in registers (no DRAM traffic yet for subsequent ops)
+```
+
+**Step 2 — Matmul: Compute h = x @ W1 (register-to-register, no memory write)**
+
+```python
+h = x @ W1   # matmul: (128, 1024) @ (1024, 4096) → (128, 4096)
+```
+
+The hardware performs the matrix multiplication across threads. Each thread computes one row of the output:
+```
+For thread i:
+  r_h[i] = sum over k: r_x[i,k] * W1[k, :]
+  r_h[i] has shape (4096,)
+```
+
+After this step:
+```
+Register r_h[i] : holds the full matmul output row i
+                 (4096 values — result of (128, 1024) @ (1024, 4096) for this thread)
+```
+
+**Step 3 — GELU: Compute g = GELU(h) using sigmoid approximation (register-to-register)**
+
+```python
+# GELU approximation: h * sigmoid(h) * 1.702
+# Computed element-wise on the register holding the matmul result
+g = h * tl.sigmoid(h) * 1.702
+```
+
+This is the key fusion step. `h` is already in registers — the GELU reads it directly without a store/load pair:
+```
+For each element j in r_h[i]:
+  r_g[i,j] = r_h[i,j] * sigmoid(r_h[i,j]) * 1.702
+```
+
+**Step 4 — Second Matmul: Compute output = g @ W2 (still in registers)**
+
+```python
+output = g @ W2   # (128, 4096) @ (4096, 4096) → (128, 4096)
+```
+
+`g` is still in registers from Step 3. The second matmul reads it directly:
+```
+For thread i:
+  r_output[i] = sum over k: r_g[i,k] * W2[k, :]
+```
+
+**Step 5 — Second GELU: Compute final = GELU(output)**
+
+```python
+final = output * tl.sigmoid(output) * 1.702
+```
+
+**Step 6 — tl.store: Write result from registers → DRAM**
+
+```python
+tl.store(out_ptr + offs, final)   # write the fused output tile to DRAM
+```
+
+**What just happened — register lifecycle for ONE element:**
+
+```
+Thread i, element j of the output:
+
+Step 1: r_x[i,j]   = load from DRAM      (1 memory read)
+Step 2: r_h[i,j]   = r_x[i,:] @ W1[:,j]  (compute, no memory)
+Step 3: r_g[i,j]   = GELU(r_h[i,j])       (compute, no memory)
+Step 4: r_out[i,j] = r_g[i,:] @ W2[:,j]  (compute, no memory)
+Step 5: r_fin[i,j] = GELU(r_out[i,j])     (compute, no memory)
+Step 6: store to DRAM                    (1 memory write)
+
+Total memory operations per element: 1 read + 1 write = 2 memory ops
+
+Without fusion (4 separate kernels):
+  matmul1:  1 read (x) + 1 write (h to DRAM) + 1 read (h from DRAM)
+  GELU1:    1 read (h from DRAM) + 1 write (g to DRAM)
+  matmul2:  1 read (g from DRAM) + 1 write (out to DRAM) + 1 read (out from DRAM)
+  GELU2:    1 read (out from DRAM) + 1 write (final to DRAM)
+  
+Total: ~10 memory ops per element
+
+With fusion: 2 memory ops per element.
+That ~5× reduction in memory traffic is where the speedup comes from.
+```
+
+**What to watch for in real Triton kernels:** Real kernels add tiling, masking for boundary conditions, and configuration code. But the core loop structure is exactly what you see above: load, compute, compute, compute, compute, store — all in registers with no intermediate memory round-trips.
+
+---
+
+## Step-by-Step: How a Graph Becomes Python Code
+
+This section walks through `codegen.py` — how TorchInductor turns a graph back into runnable code. We use the same toy tracer from `tracer.py` and the same fusion pass from `fusion.py`.
+
+### The Input Graph (before codegen)
+
+The fusion pass in `fusion.py` transforms the raw trace into an optimized graph:
+
+```
+Before fusion (raw trace from tracer.py):
+  ('t3', 'matmul', ['x', 'w1'])
+  ('t4', 'relu',   ['t3'])
+  ('t5', 'matmul', ['t4', 'w2'])
+
+After fusion (fuse_graph output):
+  ('t4', 'fused_matmul_relu', ['x', 'w1'])    ← matmul+relu merged
+  ('t5', 'matmul', ['t4', 'w2'])              ← second matmul unchanged
+```
+
+### Step-by-Step Transformation Through codegen()
+
+The `codegen()` function in `codegen.py` processes each node in order:
+
+```python
+def codegen(graph, fn_name="compiled_fn"):
+    # Step 1: Emit function signature
+    lines = [f"def {fn_name}(x, w1, w2):"]
+
+    # Step 2: Process each node in the graph
+    for out, op, args in graph:
+        if op == "fused_matmul_relu":
+            # Node 1: matmul+relu fusion → one torch.relu(matmul) line
+            lines.append(f"    {out} = torch.relu({args[0]} @ {args[1]})")
+        elif op == "matmul":
+            # Node 2: plain matmul → one @ operator line
+            lines.append(f"    {out} = {args[0]} @ {args[1]}")
+        elif op == "relu":
+            lines.append(f"    {out} = torch.relu({args[0]})")
+        elif op == "add":
+            lines.append(f"    {out} = {args[0]} + {args[1]}")
+
+    # Step 3: Return the final output tensor name
+    lines.append(f"    return {graph[-1][0]}")
+    return "\n".join(lines)
+```
+
+### Walking Through Each Node
+
+**Node 1: `('t4', 'fused_matmul_relu', ['x', 'w1'])`**
+
+- `out = 't4'`, `op = 'fused_matmul_relu'`, `args = ['x', 'w1']`
+- Matches `op == "fused_matmul_relu"` → enters that branch
+- `args[0]` = `'x'`, `args[1]` = `'w1'`
+- Output line appended: `    t4 = torch.relu(x @ w1)`
+- The fused operation maps to one `torch.relu(matmul)` call
+
+**Node 2: `('t5', 'matmul', ['t4', 'w2'])`**
+
+- `out = 't5'`, `op = 'matmul'`, `args = ['t4', 'w2']`
+- `op == "fused_matmul_relu"` is False, `op == "matmul"` is True
+- `args[0]` = `'t4'`, `args[1]` = `'w2'`
+- Output line appended: `    t5 = t4 @ w2`
+
+**Return statement: `return graph[-1][0]`**
+
+- `graph[-1]` = `('t5', 'matmul', ['t4', 'w2'])`
+- `graph[-1][0]` = `'t5'`
+- Output line appended: `    return t5`
+
+### The Final Output
+
+Running `codegen(fuse_graph(trace(mlp, ["x", "w1", "w2"])))` produces:
+
+```python
+def compiled_fn(x, w1, w2):
+    t4 = torch.relu(x @ w1)
+    t5 = t4 @ w2
+    return t5
+```
+
+This is valid, runnable Python — the same function that `tracer.py` traced, but now reconstructed from the optimized graph.
+
+### What This Shows About Fusion
+
+In the output:
+- `t4 = torch.relu(x @ w1)` is ONE line but corresponds to TWO operations fused into one GPU kernel
+- `t5 = t4 @ w2` is a separate kernel (no relu follows it, so no fusion opportunity)
+
+In the unfused version (before fusion), the graph would be:
+```
+('t3', 'matmul', ['x', 'w1'])
+('t4', 'relu',   ['t3'])
+('t5', 'matmul', ['t4', 'w2'])
+```
+
+Which codegen would produce as:
+```python
+def compiled_fn(x, w1, w2):
+    t3 = x @ w1
+    t4 = torch.relu(t3)
+    t5 = t4 @ w2
+    return t5
+```
+
+Notice `t3` (the matmul output) appears as an intermediate variable — it would need to be materialized in memory between kernels. In the fused version, `x @ w1` result stays in a register and is passed directly to `relu` within the same kernel.
 
 ---
 
@@ -350,10 +627,15 @@ Run `dynamo.explain` to see it:
 
 ```
 Graph breaks: 1
-Graphs:       2    ← two separate compiled graphs
+Graphs: 1
 ```
 
-Two graphs means two separate GPU kernel launches instead of one fused kernel.
+**What this output means:**
+
+- `Graph breaks: 1` — Dynamo hit one untraceable operation (`.item()`) and inserted a break there
+- `Graphs: 1` — Dynamo produced one compiled graph segment *before* the break (the subsequent segment after the break is Python fallback, not a separate compiled graph)
+
+Two graphs means two separate compiled graph *segments*. The `.item()` forces a Python fallback, but the segment before it is still compiled. The key problem is that the break fragments fusion — the compiled segment cannot fuse across the break point.
 
 **Fix 1 — stay in tensor space with `torch.where`:**
 
@@ -368,8 +650,10 @@ Running `dynamo.explain` on the fixed module:
 
 ```
 Graph breaks: 0
-Graphs:       1    ← one graph, fully fused
+Graphs: 1
 ```
+
+Zero breaks — the entire forward pass is one compiled graph, fully fused.
 
 **Fix 2 — use `torch.any()` for boolean conditions:**
 

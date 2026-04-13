@@ -4,6 +4,8 @@ Real benchmark numbers across hardware configurations, profiling tips, and troub
 
 ---
 
+**Note: All numbers below are placeholder examples. Run the Python files in this directory on your multi-GPU setup to get real measurements.**
+
 ## Benchmark: Init Method Overhead
 
 Measured on 2x NVIDIA A100-SXM4-80GB, NVLink connected.
@@ -80,6 +82,19 @@ NCCL is 20-30x faster than Gloo. Always use NCCL for GPU training.
 
 ---
 
+## Running the Benchmarks
+
+Run these Python files on your multi-GPU setup to produce real measurements:
+
+| File | Produces |
+|------|----------|
+| `init.py` | Init Method Overhead table (NCCL vs Gloo latency) |
+| `all_reduce.py` | all_reduce Bandwidth Scaling table, Collective Operation Latency table |
+| `ddp.py` | DDP Speedup vs Single GPU table |
+| `collective_ops.py` | NCCL vs Gloo for all_reduce table |
+
+---
+
 ## Profiling Across Ranks
 
 ### Use torch.distributed.optim._utils to Debug
@@ -87,13 +102,22 @@ NCCL is 20-30x faster than Gloo. Always use NCCL for GPU training.
 Gradient sync issues often appear as mismatched parameter values after `backward()`:
 
 ```python
-# Check if gradients are synchronized
+import numpy as np
+
+# Check if gradients are synchronized across ranks
 for name, param in model.named_parameters():
     if param.grad is not None:
-        # All ranks should have the same gradient after sync
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-        param.grad /= world_size
-        # Now param.grad should be identical across ranks
+        # Gather gradients from all ranks to compare
+        grad_tensor = param.grad.clone()
+        grads = [torch.zeros_like(grad_tensor) for _ in range(world_size)]
+        dist.all_gather(grads, grad_tensor)
+
+        if rank == 0:
+            # Compare all ranks' gradients to rank 0's
+            rank0_grad = grads[0].cpu().numpy()
+            for r, g in enumerate(grads[1:], 1):
+                if not np.allclose(rank0_grad, g.cpu().numpy(), rtol=1e-5, atol=1e-5):
+                    print(f"Mismatch on {name} between rank 0 and rank {r}")
 ```
 
 ### Profile with PyTorch Profiler
@@ -224,7 +248,24 @@ On each node, before running training:
 nc -zv 192.168.1.100 29500
 ```
 
-If the port is not reachable, check firewall rules on both nodes.
+`nc -zv` (scan mode) only verifies that the target port is open and something is listening — it sends a TCP SYN and confirms a SYN-ACK is received. It does NOT verify:
+- That your application can actually bind to and use the port
+- Bidirectional communication (e.g., the target can send data back to you)
+- That NCCL's specific transport (whether using sockets, RDMA, or InfiniBand) will work
+
+A port can appear open yet NCCL initialization still fail due to firewall rules, routing issues, or NIC configuration.
+
+For full bidirectional verification, test from both directions:
+
+```bash
+# From node 0 to node 1:
+nc -zv 192.168.1.101 29500
+
+# From node 1 to node 0:
+nc -zv 192.168.1.100 29500
+```
+
+If either direction fails, check firewall rules (`iptables`, `ufw`, cloud security groups) on both nodes.
 
 ---
 

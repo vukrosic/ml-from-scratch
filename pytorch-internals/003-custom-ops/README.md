@@ -24,23 +24,54 @@ To do any of these, you need to define your own `backward()` function. That's wh
 
 ## Custom ReLU with torch.autograd.Function
 
+> **Mental Model:** A `torch.autograd.Function` is a custom-defined backward pass. Normally PyTorch computes gradients automatically via the chain rule. This lets you say "when going backward through my operation, do THIS calculation instead of the standard one." The forward does computation, the backward defines the gradient formula.
+
+**Before this section you should understand:** What a gradient is (signal flowing backward through a computation graph).
+
+**After this section you will be able to:** Write a custom autograd Function with explicit forward and backward steps, and explain what `ctx.save_for_backward` does.
+
 A `torch.autograd.Function` pairs a forward pass with a user-defined backward pass. PyTorch's autograd engine calls the backward pass automatically when you call `.backward()` on the output.
 
 ```python
 import torch
 
 class ReLUFunction(torch.autograd.Function):
+    # Line 1: @staticmethod — this method belongs to the class, not instances.
+    #           PyTorch calls ReLUFunction.forward(ctx, x), not instance.forward(x).
+    #           There is no "self" because the class itself is the op definition.
     @staticmethod
     def forward(ctx, x):
-        # ctx.save_for_backward stores Tensors needed in backward().
+        # ctx is a Context object — like a scratch pad for passing data
+        #           from forward() to backward(). It is NOT the same as 'self'.
+        #
+        # ctx.save_for_backward(x) — stores x in a safe place that
+        #           backward() can retrieve later. PyTorch holds onto these
+        #           tensors until backpropagation finishes, then clears them.
+        #           Why store? Because backward() runs LATER, after forward()
+        #           has already finished. Without save_for_backward, x would
+        #           be gone from scope.
         ctx.save_for_backward(x)
         return x.clamp(min=0)
 
     @staticmethod
     def backward(ctx, grad_output):
-        # grad_output is the gradient flowing back from downstream ops.
+        # grad_output — the gradient of (loss w.r.t. THIS op's output).
+        #           Shape matches the forward output. Every element tells us
+        #           "how much did the loss change if we nudge THIS element?"
+        #
+        # ctx.saved_tensors — tuple of tensors saved by save_for_backward().
+        #           Unpacking with comma: x, = because it's always a tuple.
         x, = ctx.saved_tensors
+        # x is the SAME tensor from forward — now we have it in backward.
+
+        # mask = x > 0
+        #   For each element: True (1) if positive, False (0) if negative.
+        #   This IS the ReLU derivative: d/dx max(0,x) = 1 if x>0 else 0.
         mask = x > 0
+
+        # grad_output * mask  — chain rule: grad_through_this_op = grad_output * local_grad
+        #   Where x > 0:  grad_output * 1  = grad_output passes through unchanged
+        #   Where x <= 0: grad_output * 0  = 0 (ReLU kills the gradient)
         return grad_output * mask
 ```
 
@@ -52,6 +83,12 @@ The mask `x > 0` is exactly the derivative of ReLU: `1` where `x > 0`, `0` elsew
 
 ## Gradient amplification
 
+> **Mental Model:** Gradient amplification means "multiply the gradient by a factor before it flows further backward." You might do this to give extra training signal to certain pathways — in this case, we double the gradient for inputs that were already positive (active in the forward pass).
+
+**Before this section you should understand:** What `ctx.save_for_backward` and `grad_output` mean in the backward pass.
+
+**After this section you will be able to:** Modify gradients in a custom backward pass — doubling, clipping, or redirecting them.
+
 Here's the "useful example" I promised. In `backward()`, we amplify gradients where `x > 0` by a factor of 2:
 
 ```python
@@ -62,6 +99,36 @@ Here's the "useful example" I promised. In `backward()`, we amplify gradients wh
         # Double the gradient for positive inputs.
         amplified = grad_output * mask * 2.0
         return amplified
+```
+
+Walk through with actual values — input `x = [1., -2., 3., -4.]`:
+
+```
+Step 1 — Forward pass (x.clamp(min=0)):
+    x          = [ 1.,  -2.,   3.,  -4.]
+    ReLU(x)    = [ 1.,   0.,   3.,   0.]   ← zeros out negatives
+
+Step 2 — Suppose downstream gradient (grad_output) is the SAME as ReLU output
+         (e.g., loss = sum(ReLU(x)), so d(loss)/d(ReLU) = 1 for each element):
+    grad_output = [ 1.,   0.,   3.,   0.]
+
+Step 3 — Compute mask (x > 0):
+    mask = [ 1.,   0.,   1.,   0.]   ← True→1, False→0
+
+Step 4 — Apply chain rule first (grad_output * mask):
+    grad_after_chain = [ 1.,   0.,   3.,   0.]
+    (element 0: 1*1=1, element 1: 0*0=0, element 2: 3*1=3, element 3: 0*0=0)
+
+Step 5 — Amplify by factor of 2 for positive regions:
+    amplified = grad_after_chain * 2.0
+              = [ 2.,   0.,   6.,   0.]
+```
+
+Compare against standard (non-amplified) ReLU backward:
+
+```
+Standard ReLU backward:   [ 1.,   0.,   3.,   0.]
+Amplified backward:        [ 2.,   0.,   6.,   0.]   ← 2x for active (positive) inputs
 ```
 
 Run `custom_relu.py` and you will see:
@@ -86,6 +153,12 @@ def custom_relu(x):
 ---
 
 ## Registering with torch.library for torch.compile
+
+> **Mental Model:** `torch.compile` traces your code to build a graph of operations. When it sees a custom `autograd.Function`, it treats it as a "black box" — it can't see inside to fuse it with neighboring ops. Registering with `torch.library` puts your op in PyTorch's official operator registry, so `torch.compile` recognizes it and can optimize across it.
+
+**Before this section you should understand:** How `torch.autograd.Function` defines a custom backward pass.
+
+**After this section you will be able to:** Register a custom op with `torch.library` so that `torch.compile` treats it as a first-class graph node instead of a graph break.
 
 `torch.compile` traces the autograd graph and generates optimized kernels. A custom `Function` appears in the trace as an opaque node — a "graph break". PyTorch falls back to running your op in Python, losing the performance benefits of compilation.
 
@@ -120,6 +193,12 @@ PyTorch treats it as a fallback op. The results are correct, but compile cannot 
 ---
 
 ## Benchmark: custom op vs nn.ReLU
+
+> **Mental Model:** The benchmark answers: "Is writing a custom op faster?" The answer is usually no for Python-level ops — the speed benefit comes from writing GPU kernels (CUDA/Triton), not from the Python code itself.
+
+**Before this section you should understand:** How `torch.autograd.Function` works and why registration exists.
+
+**After this section you will be able to:** Measure op overhead and explain why custom Python ops are typically slower than built-ins.
 
 The benchmark in `benchmark.py` runs forward+backward passes for both ops:
 

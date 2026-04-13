@@ -82,6 +82,8 @@ if __name__ == "__main__":
 
 ### Expected Output
 
+> **Expected on GTX 1070 Ti or similar. Your numbers will vary. Run `python streams.py` on your GPU to measure.**
+
 ```
 Default stream (sequential): ~120.00 ms
 Custom stream (concurrent):  ~60.00 ms
@@ -358,6 +360,8 @@ if __name__ == "__main__":
 
 ### Expected Output
 
+> **Expected on GTX 1070 Ti or similar. Your numbers will vary. Run `python overlap.py` on your GPU to measure.**
+
 ```
 === Data Transfer vs Compute Overlap ===
 
@@ -391,6 +395,8 @@ Key things to look for in the timeline:
 1. **Stream 0 (default)** and **Stream N (custom)** bars interleaving — confirms concurrent execution.
 2. **Data transfer bars** overlapping with **compute bars** — confirms the overlap is working.
 3. **Gaps in stream bars** — indicate idle time or CPU-side stalls.
+
+**What good looks like:** Stream 0 and custom stream bars are visibly overlapped in the timeline, with no gaps between compute and transfer. **What bad looks like:** bars are sequential (one finishes then the other starts), indicating no overlap.
 
 ---
 
