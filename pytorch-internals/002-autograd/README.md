@@ -174,7 +174,7 @@ class Value:
             node._backward()
 ```
 
-You can copy-paste this directly into a Python file and run it. The file `autograd.py` in this directory contains the same implementation plus a `GradientTape` helper and example usage.
+You can copy-paste this directly into a Python file and run it. The file `autograd.py` in this directory contains the same implementation plus example usage.
 
 ---
 
@@ -186,9 +186,9 @@ The gradients **accumulate** rather than reset. Each `backward()` call propagate
 
 ```python
 a = Value(2.0, label="a")
-b = a * a        # b = 4.0, b.grad_fn knows: a.grad += a.data * b.grad = 2.0 * 1.0
-b.backward()     # a.grad = 2.0 * 1.0 = 2.0  (one pass)
-b.backward()     # a.grad = 2.0 + 2.0 = 4.0  (accumulates!)
+b = a * a        # b = 4.0
+b.backward()     # a.grad = 4.0  (one pass)
+b.backward()     # a.grad = 8.0  (accumulates!)
 ```
 
 Trace through with actual numbers:
@@ -196,13 +196,14 @@ Trace through with actual numbers:
 ```
 First backward():
   b.grad = 1.0  (seed)
-  b._backward(): a.grad += a.data * b.grad = 2.0 * 1.0 = 2.0
-  Result: a.grad = 2.0
+  b._backward(): left input contributes 2.0 * 1.0 = 2.0
+  b._backward(): right input contributes 2.0 * 1.0 = 2.0
+  Result: a.grad = 4.0
 
 Second backward() (no reset!):
   b.grad = 1.0  (seed again — no reset between calls)
-  b._backward(): a.grad += a.data * b.grad = 2.0 * 1.0 = 2.0
-  Result: a.grad = 2.0 + 2.0 = 4.0  (accumulated!)
+  b._backward(): adds 4.0 more through the same two paths
+  Result: a.grad = 4.0 + 4.0 = 8.0  (accumulated!)
 ```
 
 In PyTorch this is the same — `optimizer.step()` does not clear gradients; you must call `optimizer.zero_grad()` explicitly. This design choice exists because **gradient accumulation** is a real technique: when a GPU cannot fit a large batch, you run several small batches and accumulate gradients before stepping.
@@ -744,8 +745,8 @@ Notice three things:
 
 ## Running It
 
-```python
-python autograd.py
+```bash
+python3 autograd.py
 ```
 
 ```
@@ -762,7 +763,7 @@ Individual gradients:
 `visualize.py` draws the computation graph as ASCII art — both a tree view and a flat node view showing data and gradient values at each node.
 
 ```bash
-python visualize.py
+python3 visualize.py
 ```
 
 The tree view shows the structure of operations:
@@ -786,7 +787,7 @@ The tree view shows the structure of operations:
 `compare.py` runs the same computation graph with both our engine and `torch.autograd`, then prints a side-by-side comparison across multiple test cases.
 
 ```bash
-python compare.py
+python3 compare.py
 ```
 
 ```
@@ -827,7 +828,7 @@ Before diving into ADVANCED, be aware of the most frequent mistakes even experie
 |---------|---------|-----|
 | Using `=` instead of `+=` in `_backward` | Gradients are wrong when a node is used in multiple places | Always use `+=` — see the `+=` explanation above |
 | Calling `backward()` twice without resetting | Gradients accumulate (sometimes intended, sometimes not) | Re-create `Value` objects for fresh runs |
-| In-place modification of a tensor used in the graph | Silent wrong gradients (or crash in PyTorch) | Use out-of-place ops: `x = x + 1` not `x += 1` |
+| In-place modification of a tensor used in the graph | RuntimeError in PyTorch; silent wrong gradients in naive engines | Use out-of-place ops: `x = x + 1` not `x += 1` |
 
 > **ADVANCED.md covers these in depth**, including how PyTorch's version counter detects in-place corruption, how hooks can clip gradients mid-flight, and why `zero_grad()` is necessary between training iterations.
 
@@ -848,4 +849,4 @@ The same two-pass strategy (forward record, backward replay) is exactly what pow
 
 ---
 
-Get the video walkthrough of Jacobian derivation, PyTorch hook system internals, custom autograd Functions, and profiling: [OpenSuperintelligenceLab on Skool](https://www.skool.com/opensuperintelligencelab)
+Get the video walkthrough of Jacobian derivation, PyTorch hook system internals, custom autograd Functions, and profiling: [Become AI Researcher on Skool](https://www.skool.com/become-ai-researcher-2669/about)

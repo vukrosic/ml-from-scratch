@@ -1,350 +1,458 @@
 # Autograd Advanced
 
-> **Before reading this, read [README.md](./README.md) first.** This article assumes you understand the `Value` class, the forward/backward two-pass strategy, and how the chain rule propagates gradients through a computation graph. ADVANCED goes deeper — how PyTorch scales this to tensors, the hook system, custom autograd Functions, gradient accumulation pitfalls, and memory.
+> Read [README.md](./README.md) first.
 >
-> **Run the Python files in this directory** to verify everything against PyTorch.
+> This guide assumes you already understand the tiny scalar `Value` engine in `autograd.py`. Here we connect that mental model to real PyTorch autograd, step by step.
 
 ---
 
-## Which File to Run For What
+## Files In This Folder
 
-| File | What it demonstrates |
-|------|---------------------|
-| `autograd.py` | The core engine — `Value` class with forward/backward |
-| `compare.py` | Side-by-side gradient comparison against `torch.autograd` |
-| `visualize.py` | ASCII computation graph — tree view and flat node view |
+| File | Purpose |
+| --- | --- |
+| `autograd.py` | Tiny scalar autograd engine |
+| `compare.py` | Compares our engine with `torch.autograd` |
+| `visualize.py` | Prints the computation graph |
 
----
+Recommended order:
 
-## From Scalars to Tensors: What Changes
-
-Our engine operates on floats. PyTorch operates on tensors. The core algorithm is identical — the difference is what "gradient" means.
-
-### Scalar case (our engine)
-
-For a scalar `y = f(x)`, the gradient is a single number `dy/dx`.
-
-```
-x = 3.0
-y = x * x = 9.0
-dy/dx = 2 * x = 6.0      ← one number
-```
-
-In our engine, `_backward` multiplies the upstream gradient by this one number.
-
-### Vector case (PyTorch)
-
-For a vector `y = f(x)` where `x` has shape `(n,)` and `y` has shape `(m,)`, the gradient is a **Jacobian matrix** of shape `(m, n)`:
-
-```
-J[i,j] = d(y_i) / d(x_j)
-```
-
-Concrete example — `y = W @ x` where `W` is a 2x3 matrix and `x` is a 3-vector:
-
-```
-x = [x0, x1, x2]       ← shape (3,)
-W = [[w00, w01, w02],
-     [w10, w11, w12]]   ← shape (2, 3)
-
-y = W @ x = [w00*x0 + w01*x1 + w02*x2,
-             w10*x0 + w11*x1 + w12*x2]    ← shape (2,)
-
-Jacobian dy/dx has shape (2, 3). Expanding each element:
-
-```
-d(y_i)/d(x_j) = w_ij   (the (i,j)-th element of W)
-```
-
-So the Jacobian matrix is simply W itself:
-
-```
-          ∂y               ∂y
-dy/dx = -------   =  [[w00, w01, w02],     =  [[w00, w01, w02],
-        ∂x                 [w10, w11, w12]]      [w10, w11, w12]]
-
-                         =  W
-```
-
-This is a key insight: for a linear layer `y = W @ x`, the Jacobian `∂y/∂x` is just `W`. PyTorch never materializes this matrix — it uses `W` directly in the VJP.
-
-### The VJP trick
-
-For a scalar loss `L = g(y)`, what we actually want is `dL/dx` — a vector of shape `(n,)`. By the chain rule:
-
-```
-dL/dx = (dL/dy) @ J
-```
-
-This is a **vector-Jacobian product** (VJP). The "vector" is `dL/dy` (shape `(m,)`), the Jacobian is `J` (shape `(m, n)`), and the result is `dL/dx` (shape `(n,)`).
-
-PyTorch never builds the full Jacobian matrix. For `y = W @ x`:
-
-```
-dL/dx = (dL/dy) @ W     ← this is W.T @ (dL/dy), computed directly
-```
-
-No `(m, n)` matrix is ever allocated. The VJP function for matrix multiply knows how to compute the result using `W` directly.
-
-```
-Scalar autograd (our engine):
-  self.grad += other.data * out.grad          ← scalar * scalar
-
-Tensor autograd (PyTorch):
-  x.grad += W.T @ out.grad                   ← matrix-vector product (VJP)
-```
-
-The topology of the graph is the same. The `_backward` closures just do matrix math instead of scalar math.
+1. Read `README.md`
+2. Run `python autograd.py`
+3. Run `python compare.py`
+4. Run `python visualize.py`
+5. Read this file
 
 ---
 
-## The Computation Graph in PyTorch
+## Learning Path
 
-PyTorch builds the same DAG we build, but with different node types. Let's trace through a concrete example:
+This file is organized as a sequence of upgrades:
+
+1. Recall what our scalar engine is doing.
+2. Move from scalar derivatives to tensor gradients.
+3. Inspect the graph PyTorch actually builds.
+4. See why gradient accumulation uses `+=`.
+5. Intercept gradients with hooks.
+6. Write a custom `torch.autograd.Function`.
+7. Understand leaves, `retain_grad()`, `detach()`, `no_grad()`, and `inference_mode()`.
+8. Compute higher-order gradients.
+9. Understand memory and gradient checkpointing.
+10. Review the common ways autograd code breaks.
+
+---
+
+## Step 1: Re-anchor On The Scalar Engine
+
+Our engine in `autograd.py` does three things:
+
+1. Each forward operation creates a new `Value`.
+2. Each new `Value` stores references to its parents in `_prev`.
+3. Each new `Value` stores a `_backward` closure that knows the local derivative rule.
+
+The full backward pass is still just:
+
+1. Build a topological order of the graph.
+2. Seed the output gradient with `1.0`.
+3. Visit nodes in reverse topological order.
+4. Let each node push gradient into its parents.
+
+Core pattern from our engine:
 
 ```python
+def __mul__(self, other):
+    other = other if isinstance(other, Value) else Value(other)
+    out = Value(self.data * other.data, _op="*", _prev=(self, other))
+
+    def _backward():
+        self.grad += other.data * out.grad
+        other.grad += self.data * out.grad
+
+    out._backward = _backward
+    return out
+```
+
+What matters here is not multiplication specifically. The important pattern is:
+
+1. Forward computes `out.data`.
+2. Backward receives `out.grad`.
+3. Backward multiplies by local derivatives.
+4. Results accumulate into parent gradients.
+
+That exact pattern still exists in PyTorch. The main difference is that PyTorch does it for tensors instead of single floats.
+
+---
+
+## Step 2: Move From Scalars To Tensors
+
+### Step 2.1: Scalar case
+
+For a scalar function `y = f(x)`, the gradient is one number:
+
+```text
+x = 3.0
+y = x * x = 9.0
+dy/dx = 2 * x = 6.0
+```
+
+Our engine handles this directly because every node stores:
+
+- one scalar value
+- one scalar gradient
+
+### Step 2.2: Tensor case
+
+For tensor-valued functions, the local derivative is no longer a single number.
+
+If `x` has shape `(n,)` and `y` has shape `(m,)`, then the derivative of `y` with respect to `x` is a Jacobian:
+
+```text
+J[i, j] = d y[i] / d x[j]
+shape(J) = (m, n)
+```
+
+Example:
+
+```text
+x shape: (3,)
+W shape: (2, 3)
+y = W @ x
+y shape: (2,)
+```
+
+Expanded:
+
+```text
+y[0] = w00*x0 + w01*x1 + w02*x2
+y[1] = w10*x0 + w11*x1 + w12*x2
+```
+
+So:
+
+```text
+d y[0] / d x = [w00, w01, w02]
+d y[1] / d x = [w10, w11, w12]
+```
+
+The full Jacobian is:
+
+```text
+d y / d x = W
+```
+
+### Step 2.3: What PyTorch actually computes
+
+In training, we usually do not need the full Jacobian.
+
+We usually have a scalar loss `L`, and we want:
+
+```text
+dL/dx
+```
+
+By the chain rule:
+
+```text
+dL/dx = (dL/dy) @ (dy/dx)
+```
+
+This is a vector-Jacobian product, or VJP.
+
+For `y = W @ x`, PyTorch computes:
+
+```text
+grad_y = dL/dy
+grad_x = W.T @ grad_y
+grad_W = grad_y outer x
+```
+
+The key idea:
+
+1. PyTorch does not materialize the full Jacobian in normal backprop.
+2. It uses operation-specific backward formulas directly.
+3. The graph structure is the same as our engine.
+4. Only the math inside each backward rule gets bigger.
+
+Side-by-side:
+
+```text
+Our scalar engine:
+    self.grad += other.data * out.grad
+
+PyTorch tensor autograd:
+    x.grad += W.T @ out.grad
+```
+
+Same algorithm. Bigger objects.
+
+---
+
+## Step 3: Inspect The Graph PyTorch Builds
+
+Consider:
+
+```python
+import torch
+
 x = torch.tensor([2.0], requires_grad=True)
 y = x * 3
 z = y.relu()
 loss = z.sum()
 ```
 
-In our engine, this graph would look like:
+In our toy engine, we would imagine something like:
 
-```
-Value("x", data=2.0) → Value("*", data=6.0) → Value("relu", data=6.0) → Value("sum", data=6.0)
-  ._prev = ()           ._prev = (x, 3)        ._prev = (y,)             ._prev = (z,)
-  ._backward = noop     ._backward = mul_bw     ._backward = relu_bw      ._backward = sum_bw
+```text
+x -> mul -> relu -> sum
 ```
 
-In PyTorch, the same graph uses different objects:
-
-```
-x (leaf Tensor)  →  MulBackward0  →  ReluBackward0  →  SumBackward0
-  .grad_fn = None     .next_functions = [(AccumulateGrad, 0)]
-  .requires_grad = True                    │
-  .grad = None (until backward)            │
-                                   .next_functions = [(MulBackward0, 0)]
-```
-
-You can inspect this directly:
+In PyTorch, the output tensors point to backward nodes through `grad_fn`:
 
 ```python
-print(loss.grad_fn)                    # <SumBackward0 object>
-print(loss.grad_fn.next_functions)     # ((ReluBackward0, 0),)
-print(z.grad_fn)                       # <ReluBackward0 object>
-print(z.grad_fn.next_functions)        # ((MulBackward0, 0),)
-print(y.grad_fn)                       # <MulBackward0 object>
-print(x.grad_fn)                       # None — x is a leaf
-print(x.is_leaf)                       # True
+print(loss.grad_fn)
+print(loss.grad_fn.next_functions)
+print(z.grad_fn)
+print(y.grad_fn)
+print(x.grad_fn)
+print(x.is_leaf)
 ```
 
-Key differences:
+Typical mental model:
+
+```text
+x (leaf tensor)
+  -> MulBackward
+  -> ReluBackward
+  -> SumBackward
+```
+
+Map the toy engine to PyTorch like this:
 
 | Our engine | PyTorch |
-|-----------|---------|
-| `Value._backward` closure | `grad_fn` object (e.g., `MulBackward0`) |
-| `Value._prev` tuple | `grad_fn.next_functions` tuple |
-| `Value.grad` on every node | `.grad` only on leaf tensors (unless `retain_grad()`) |
-| No version tracking | Version counter detects in-place mutations |
+| --- | --- |
+| `_prev` | `grad_fn.next_functions` |
+| `_backward` closure | backward node object such as `MulBackward0` |
+| `.grad` on every node | `.grad` kept on leaves by default |
+| no mutation tracking | version counters catch unsafe in-place edits |
 
-**Why `.grad` only on leaves?** In a real network, intermediate activations are huge. Storing gradients on every intermediate tensor would double memory usage. PyTorch only stores gradients where you need them — on parameters (leaves) that the optimizer will update. Intermediate gradients are computed, used to push backward, then freed.
+### Step 3.1: Leaf vs non-leaf tensors
 
-**The version counter.** If you modify a tensor in-place after it was used in a computation:
+A leaf tensor is a tensor you create directly:
+
+```python
+x = torch.tensor([2.0], requires_grad=True)
+```
+
+A non-leaf tensor is produced by an operation:
+
+```python
+y = x * 3
+z = y.relu()
+```
+
+Why this matters:
+
+1. Leaves usually represent parameters or user-provided inputs.
+2. PyTorch stores `.grad` on leaves by default.
+3. Non-leaf gradients are normally computed, used, and then discarded.
+
+### Step 3.2: Why in-place ops are dangerous
+
+Suppose you do:
 
 ```python
 x = torch.tensor([1.0], requires_grad=True)
 y = x * 2
-x.add_(1)     # in-place modification — increments version counter
-y.backward()  # RuntimeError: one of the variables needed for gradient
-              # computation has been modified by an inplace operation
+z = y * y
+y.add_(1)
+z.backward()
 ```
 
-What happened: `y = x * 2` recorded that `y`'s backward needs `x.data`. But `x.add_(1)` changed `x.data` in place. When `y.backward()` runs, the `x.data` it sees is no longer the value used during the forward pass — the gradient would be wrong. PyTorch catches this with a version counter: `x._version` increments on every in-place op, and backward checks that it has not changed.
+`z = y * y` needs the original `y` during backward.
 
-Our engine has no such protection — in-place modifications would silently produce wrong gradients.
+But `y.add_(1)` changed that saved value in place.
+
+PyTorch tracks this with version counters and raises an error instead of silently returning the wrong gradient.
+
+Our toy engine has no such protection. If we mutated saved data in place, it would just compute garbage.
+
+Rule of thumb:
+
+- In differentiable code, prefer out-of-place ops.
+- Treat in-place ops as unsafe unless you know the backward rule does not need the old value.
 
 ---
 
-## Gradient Accumulation: The `+=` Problem
+## Step 4: Why Gradient Accumulation Uses `+=`
 
-In our engine, `_backward` uses `+=` to accumulate gradients. This is not just a convenience — it is mathematically required. Let's trace through exactly why.
+This is one of the most important details in the whole engine.
 
-### Simple case: value used once
+### Step 4.1: Single-use node
 
 ```python
 a = Value(3.0)
 b = Value(5.0)
-c = a * b         # c = 15.0
+c = a * b
 ```
 
-During backward, `c._backward()` runs:
+Backward contribution:
 
 ```python
-a.grad += b.data * c.grad    # a.grad += 5.0 * 1.0 = 5.0
-b.grad += a.data * c.grad    # b.grad += 3.0 * 1.0 = 3.0
+a.grad += b.data * c.grad
+b.grad += a.data * c.grad
 ```
 
-One path, one contribution. `+=` and `=` give the same result here.
+Here `+=` and `=` happen to give the same result because each parent receives one contribution.
 
-### Problem case: value used twice
+### Step 4.2: Node reused twice
 
 ```python
 a = Value(3.0)
-c = a + a          # c = 6.0
+c = a + a
 ```
 
-The graph has two edges from `a` to `c`:
+Now `a` appears twice as an input to the same operation.
 
-```
-a ──(left input)──→ c
-a ──(right input)──→ c
-```
-
-`c._backward()` runs:
+Backward for addition:
 
 ```python
-# __add__ backward:
-self.grad  += out.grad     # a.grad += 1.0 (first edge: a is self)
-other.grad += out.grad     # a.grad += 1.0 (second edge: a is also other)
+self.grad += out.grad
+other.grad += out.grad
 ```
 
-Result: `a.grad = 2.0`. Correct — `d(a+a)/da = 2`.
+Since `self` and `other` are the same object, `a.grad` gets hit twice:
 
-With `=` instead of `+=`:
+```text
+a.grad = 1.0 + 1.0 = 2.0
+```
+
+That is correct because:
+
+```text
+d(a + a)/da = 2
+```
+
+If you used `=` instead, the second assignment would overwrite the first one.
+
+### Step 4.3: Branching graph
+
+The same issue appears whenever one value feeds multiple downstream paths.
+
+Example from `autograd.py`:
 
 ```python
-self.grad  = out.grad      # a.grad = 1.0
-other.grad = out.grad      # a.grad = 1.0 (overwrites!)
+a = Value(2.0, label="a")
+b = a * a
+c = Value(3.0, label="c")
+d = b.relu()
+e = c * a
+f = d + e
+g = f.tanh()
 ```
 
-Result: `a.grad = 1.0`. Wrong — should be 2.
+`a` influences the output through multiple routes:
 
-### Complex case: value used in multiple branches
+1. through the left input of `b = a * a`
+2. through the right input of `b = a * a`
+3. through `e = c * a`
 
-```
-        a
-       / \
-      /   \
-   b=a*a  e=c*a
-     |      |
-   d=relu  (e)
-     |      |
-      \    /
-       f=d+e
-         |
-       g=tanh(f)
-```
+The total gradient is the sum of all path contributions.
 
-`a` appears three times: twice in `b = a*a` (left and right input to multiply) and once in `e = c*a`. The total gradient is the **sum** of contributions from all three paths:
+That is why accumulation is not optional.
 
-```
-dg/da = dg/da via (a as left input to b)      ← a.data appears as other.data in b's backward
-      + dg/da via (a as right input to b)     ← a.data appears as self.data in b's backward
-      + dg/da via (a as right input to e)     ← c.data appears as other.data in e's backward
+### Step 4.4: PyTorch does the same thing
+
+PyTorch accumulates gradients into leaf `.grad` buffers.
+
+That is also why training loops need:
+
+```python
+optimizer.zero_grad()
+loss.backward()
+optimizer.step()
 ```
 
-Each `_backward` call does `a.grad += ...`. Three calls, three contributions, all summed. With `=`, only the last call's contribution survives.
+Without `zero_grad()`, each new backward pass adds into the previous gradients.
 
-This is mathematically the **multivariate chain rule**: when a variable appears in multiple terms, you sum the partial derivatives from each term.
-
-PyTorch handles this identically — `AccumulateGrad` nodes sum gradients from all incoming paths before storing the result in `tensor.grad`.
+That behavior is sometimes useful for gradient accumulation across micro-batches, but it is a bug if you did not mean to do it.
 
 ---
 
-## Hooks: Intercepting Gradients
+## Step 5: Intercept Gradients With Hooks
 
-PyTorch lets you attach functions that run during the backward pass. There are three types:
+Hooks let you observe or modify gradients while backward is running.
 
-### Tensor hooks — `register_hook()`
-
-Fires when the gradient for a specific tensor is computed. The hook function receives one argument: the gradient tensor.
+### Step 5.1: Tensor hook with `register_hook()`
 
 ```python
+import torch
+
 x = torch.tensor([2.0], requires_grad=True)
 
 def print_grad(grad):
-    print(f"x.grad flowing through: {grad}")
+    print("incoming grad:", grad)
 
 x.register_hook(print_grad)
 
 y = (x * x).sum()
 y.backward()
-# prints: x.grad flowing through: tensor([4.])
 ```
 
-What happens step by step:
-1. `y.backward()` starts the backward pass
-2. Gradients flow from `y` through `sum`, through `mul`
-3. When the gradient for `x` is ready, PyTorch calls `print_grad(tensor([4.]))`
-4. Then stores it in `x.grad`
+What happens:
 
-The hook sees the gradient **before** it lands in `x.grad`. You can modify it by returning a new tensor:
+1. `y.backward()` starts the backward pass.
+2. PyTorch computes the gradient flowing into `x`.
+3. Your hook receives that gradient tensor.
+4. PyTorch then stores the final value in `x.grad`.
+
+You can also modify the gradient:
 
 ```python
-def double_grad(grad):
-    return grad * 2    # modifies the gradient in-flight
+x = torch.tensor([2.0], requires_grad=True)
+x.register_hook(lambda grad: grad * 2)
 
-x.register_hook(double_grad)
+y = (x * x).sum()
+y.backward()
+print(x.grad)  # tensor([8.]) instead of tensor([4.])
 ```
 
-Now `x.grad` will be `tensor([8.])` instead of `tensor([4.])`. The hook intercepted the gradient and doubled it. This is how per-parameter gradient clipping works — the hook caps the gradient magnitude before the optimizer sees it.
-
-### Module hooks — `register_full_backward_hook()`
-
-Fires when gradients flow through a module's backward pass:
+### Step 5.2: Module hook with `register_full_backward_hook()`
 
 ```python
 def hook_fn(module, grad_input, grad_output):
-    print(f"{module.__class__.__name__}: grad_output={grad_output[0].shape}")
+    print(module.__class__.__name__)
+    print("grad_input:", grad_input)
+    print("grad_output:", grad_output)
 
-model.linear1.register_full_backward_hook(hook_fn)
+handle = model.layer.register_full_backward_hook(hook_fn)
 ```
 
-This is how gradient clipping per-layer, gradient logging, and debugging tools work.
+Use this when you want to inspect gradients flowing through an `nn.Module`, not just a single tensor.
 
-### Global hooks — `register_module_full_backward_hook()`
+### Step 5.3: What the equivalent would be in our engine
 
-Fires for every module in the network. Useful for gradient norm monitoring across the entire model.
-
-### What hooks look like in our engine
-
-Our engine does not have hooks, but the equivalent would be wrapping `_backward`:
+Our toy engine has no hook API, but conceptually you could wrap `_backward`:
 
 ```python
-# Pseudo-hook on our Value engine
 original_backward = node._backward
 
 def hooked_backward():
     original_backward()
-    print(f"Gradient at {node._label}: {node.grad}")
+    print(node._label, node.grad)
 
 node._backward = hooked_backward
 ```
 
-> **Try It Yourself**
-> ```python
-> # In PyTorch, attach a hook that doubles the gradient
-> x = torch.tensor([2.0], requires_grad=True)
-> y = x * x
-> y.backward()
-> print(x.grad)    # tensor([4.])
->
-> # With hook that doubles it:
-> x2 = torch.tensor([2.0], requires_grad=True)
-> x2.register_hook(lambda g: g * 2)
-> y2 = x2 * x2
-> y2.backward()
-> print(x2.grad)   # tensor([8.]) — doubled by the hook
-> ```
+Same idea: run custom code at a specific point in backward.
 
 ---
 
-## Custom Autograd Functions
+## Step 6: Write A Custom `torch.autograd.Function`
 
-When PyTorch does not know how to differentiate an operation, you write a custom `torch.autograd.Function`. Let's compare our ReLU with PyTorch's custom Function version, side by side.
+Use a custom `Function` when PyTorch cannot infer the backward you want, or when you want tighter control over saved tensors and backward math.
 
-**Our engine's relu:**
+### Step 6.1: Compare our `relu()` with PyTorch's version
+
+Our toy engine:
 
 ```python
 def relu(self):
@@ -357,565 +465,435 @@ def relu(self):
     return out
 ```
 
-**PyTorch's custom Function:**
+PyTorch custom `Function`:
 
 ```python
+import torch
+
 class MyReLU(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        ctx.save_for_backward(x)       # save input for backward
+        ctx.save_for_backward(x)
         return x.clamp(min=0)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, = ctx.saved_tensors
-        grad_input = grad_output * (x > 0).float()
+        (x,) = ctx.saved_tensors
+        grad_input = grad_output * (x > 0).to(grad_output.dtype)
         return grad_input
 ```
 
-Line-by-line comparison:
+Mapping:
+
+1. Our closure captures what it needs from outer scope.
+2. PyTorch saves what it needs explicitly through `ctx`.
+3. Our backward mutates parent `.grad` fields directly.
+4. PyTorch backward returns gradients in the same order as the forward inputs.
+
+### Step 6.2: Why `ctx.save_for_backward()` exists
+
+In our engine, captured values are tiny Python floats.
+
+In PyTorch, saved objects can be large tensors. PyTorch needs explicit control over what survives until backward so it can free everything else as early as possible.
+
+Save only what backward actually needs.
+
+### Step 6.3: How to call a custom `Function`
 
 ```python
-# Ours: the closure captures self.data from the enclosing scope
-def _backward():
-    self.grad += (self.data > 0) * out.grad
-
-# PyTorch: ctx explicitly saves and retrieves tensors
-def forward(ctx, x):
-    ctx.save_for_backward(x)       # explicitly save x for later
-def backward(ctx, grad_output):
-    x, = ctx.saved_tensors         # retrieve x from ctx
+x = torch.tensor([-1.0, 2.0], requires_grad=True)
+y = MyReLU.apply(x)
+loss = y.sum()
+loss.backward()
 ```
 
-Why the explicit save? In our engine, `self.data` is a float — 8 bytes. In PyTorch, `x` could be a 100MB tensor. If the closure just captured it implicitly, Python's garbage collector could never free it. `ctx.save_for_backward()` tells PyTorch exactly which tensors need to survive until backward, so everything else can be freed.
+### Step 6.4: Minimal custom example
 
 ```python
-# Ours:
-(self.data > 0) * out.grad          # scalar bool * scalar float
+class MySin(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x.sin()
 
-# PyTorch:
-(x > 0).float() * grad_output       # tensor bool → tensor float * tensor float
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        return grad_output * x.cos()
 ```
 
-Same math, different scale. `(x > 0)` produces a boolean tensor the same shape as `x`. `.float()` converts `True/False` to `1.0/0.0`. Element-wise multiply with `grad_output` gates each gradient element.
+When to reach for this:
 
-You call the custom Function like this:
-
-```python
-# Instead of:  y = x.relu()
-# Use:         y = MyReLU.apply(x)
-```
-
-When would you write a custom Function? When you have an operation that:
-- PyTorch cannot differentiate automatically (custom CUDA kernels, numerical methods)
-- You know a more memory-efficient or numerically stable backward than autograd would produce
-- You want to fuse forward and backward into a single efficient kernel
-
-> **Try It Yourself**
-> ```python
-> class MySin(torch.autograd.Function):
->     @staticmethod
->     def forward(ctx, x):
->         ctx.save_for_backward(x)
->         return x.sin()
->
->     @staticmethod
->     def backward(ctx, grad_output):
->         x, = ctx.saved_tensors
->         return grad_output * x.cos()   # d(sin)/dx = cos
->
-> x = torch.tensor([0.5], requires_grad=True)
-> y = MySin.apply(x)
-> y.backward()
-> print(x.grad)   # cos(0.5) ≈ 0.8776
-> ```
+- custom CUDA or C++ ops
+- numerically stable backward formulas
+- memory-saving backward implementations
+- fused operations where a hand-written backward is better than the default graph
 
 ---
 
-## `retain_grad()` and Non-Leaf Tensors
+## Step 7: Control What Keeps Gradients
 
-In PyTorch, only **leaf tensors** (tensors you create directly, like parameters) keep their `.grad` after `backward()`. Intermediate tensors have their gradients freed to save memory.
+This section is where many people get confused because several APIs sound similar but do different jobs.
 
-What is a leaf tensor? Any tensor you create directly:
+### Step 7.1: `retain_grad()` for non-leaf tensors
 
-```python
-x = torch.tensor([2.0], requires_grad=True)   # leaf — you created it
-w = torch.randn(10, 5, requires_grad=True)    # leaf — you created it
-# model.linear.weight                          # leaf — nn.Module created it
-```
+By default:
 
-What is a non-leaf tensor? Any tensor produced by an operation:
+- leaf tensors keep `.grad`
+- non-leaf tensors usually do not
 
-```python
-y = x * 3     # non-leaf — produced by multiplication
-z = y + 1     # non-leaf — produced by addition
-```
-
-After backward:
+Example:
 
 ```python
-x = torch.tensor([2.0], requires_grad=True)   # leaf
-y = x * 3                                       # non-leaf, y.data = 6.0
-z = y.sum()                                      # non-leaf, z.data = 6.0
+x = torch.tensor([2.0], requires_grad=True)
+y = x * 3
+z = y.sum()
 
 z.backward()
-print(x.grad)   # tensor([3.]) — works, x is a leaf
-print(y.grad)   # None — freed! y is non-leaf
+print(x.grad)  # tensor([3.])
+print(y.grad)  # usually None
 ```
 
-Why? In a network with 100 layers, storing gradients on all 100 intermediate activations would double memory usage. You only need gradients on parameters (leaves) to update them. Intermediate gradients are computed, used to push backward to the next layer, then freed.
-
-To keep gradients on intermediate tensors, call `retain_grad()` **before** backward:
+If you want `y.grad`, request it before backward:
 
 ```python
-y.retain_grad()    # tell PyTorch to keep y's gradient
+x = torch.tensor([2.0], requires_grad=True)
+y = x * 3
+y.retain_grad()
+z = y.sum()
+
 z.backward()
-print(y.grad)      # tensor([1.]) — now available
+print(y.grad)  # tensor([1.])
 ```
 
-Step by step what happens during backward:
-1. `z.grad = 1.0` (seed)
-2. `z._backward()` computes `y.grad = 1.0` (sum backward)
-3. Normally PyTorch would free `y.grad` here — but `retain_grad()` prevents that
-4. `y._backward()` computes `x.grad = 3.0 * 1.0 = 3.0` (mul backward)
-5. `x.grad = 3.0` is kept because `x` is a leaf
+Use `retain_grad()` for debugging and inspection, not as a default habit.
 
-Our engine keeps gradients on every node because we have no memory pressure — every `Value.grad` persists. `compare.py` uses `retain_grad()` on every intermediate tensor so it can read their gradients and compare against our engine.
-
----
-
-## `no_grad()` and Inference Mode
-
-During inference, you do not need gradients. Building the computation graph wastes memory and time. PyTorch provides ways to skip it.
-
-**Without `no_grad()` — graph is built (wasteful during inference):**
+### Step 7.2: `detach()` stops gradient flow
 
 ```python
-output = model(x)
-# PyTorch records every operation:
-#   linear1 → grad_fn=AddmmBackward0
-#   relu → grad_fn=ReluBackward0
-#   linear2 → grad_fn=AddmmBackward0
-# All these grad_fn objects and saved tensors sit in memory — for nothing
+y = model(x).detach()
+loss = criterion(y, target)
+loss.backward()
 ```
 
-**With `no_grad()` — no graph:**
+This breaks the graph between `y` and the model that produced it.
+
+After `detach()`:
+
+- `y` shares data with the original tensor
+- `y` has no `grad_fn`
+- gradients do not flow back into the earlier graph
+
+That is useful when you want a frozen value. It is a bug when you did it accidentally.
+
+### Step 7.3: `torch.no_grad()`
+
+Use `no_grad()` when you want operations inside a block to avoid building an autograd graph:
 
 ```python
 with torch.no_grad():
     output = model(x)
-# No grad_fn objects created. No tensors saved for backward.
-# output.requires_grad = False
-# Memory usage drops significantly for large models.
 ```
 
-You can also use it as a decorator:
+Effects:
 
-```python
-@torch.no_grad()
-def predict(model, x):
-    return model(x)
-```
+1. intermediate ops do not create backward graph nodes
+2. outputs usually do not require gradients
+3. memory usage drops during inference
 
-**`inference_mode()` — even faster:**
+### Step 7.4: `torch.inference_mode()`
 
 ```python
 with torch.inference_mode():
     output = model(x)
-# No graph, no version tracking, no autograd metadata at all.
 ```
 
-`inference_mode` is faster because it also disables version counting (the mechanism that catches in-place modifications). Use `inference_mode` for pure inference. Use `no_grad()` when you need to mix grad and no-grad operations in the same scope.
+This is a stronger inference-only mode.
 
-In our engine, the equivalent would be creating Value objects that never set `_backward` — the `_prev` tuples would be empty, so `backward()` would have no edges to traverse.
+Use it when you are doing pure inference and do not need autograd interaction inside the block.
+
+Simple rule:
+
+- use `no_grad()` when you just want "no graph here"
+- use `inference_mode()` when the whole block is true inference work
+
+### Step 7.5: How these ideas map to our toy engine
+
+Our toy engine keeps everything:
+
+- every node keeps `.grad`
+- every operation records `_prev`
+- every output stores a `_backward`
+
+Real PyTorch is more selective because tensors are large and memory is expensive.
 
 ---
 
-## Common Bugs and Debugging
+## Step 8: Compute Higher-Order Gradients
 
-### Bug 1: Forgetting `+=` (gradient overwrite)
+PyTorch can differentiate through a gradient computation itself.
 
-```python
-# Wrong:
-self.grad = other.data * out.grad
-
-# Right:
-self.grad += other.data * out.grad
-```
-
-**Symptom**: gradients are wrong when a value is used in more than one place. Only the last path contributes.
-
-### Bug 2: Missing `zero_grad()` between iterations
+Example:
 
 ```python
-# PyTorch accumulates gradients across backward() calls
-optimizer.zero_grad()     # clear previous gradients
-loss.backward()           # accumulate new gradients
-optimizer.step()           # update parameters
-```
+import torch
 
-Without `zero_grad()`, gradients from the previous batch add to the current batch:
-
-```python
-# Iteration 1:
-loss1.backward()          # w.grad = 0.5
-
-# Iteration 2 — WITHOUT zero_grad:
-loss2.backward()          # w.grad = 0.5 + 0.3 = 0.8  ← accumulated!
-optimizer.step()          # updates using 0.8 instead of 0.3
-
-# Iteration 2 — WITH zero_grad:
-optimizer.zero_grad()     # w.grad = 0.0
-loss2.backward()          # w.grad = 0.3               ← correct
-optimizer.step()          # updates using 0.3
-```
-
-Why does PyTorch accumulate by default? Because **gradient accumulation** is a real technique: when your GPU cannot fit a large batch, you run several small batches and accumulate their gradients before stepping. Calling `zero_grad()` only every N batches gives you effectively N times the batch size. But if you always want fresh gradients each step, you must call `zero_grad()` explicitly.
-
-### Bug 3: In-place operations breaking the graph
-
-```python
-x = torch.tensor([1.0], requires_grad=True)
-y = x * 2       # y's backward needs x.data (which is currently 1.0)
-x += 1           # in-place: x.data is now 2.0, but y's backward still expects 1.0
-y.backward()     # RuntimeError!
-```
-
-What went wrong: `y = x * 2` recorded that `y._backward` needs `x.data`. The `mul` backward computes `x.grad = 2 * y.grad` — the `2` comes from `other.data`, but `x.data` is used for the other direction. When `x += 1` changes `x.data` in place, the value that `y._backward` will read is no longer the value from the forward pass.
-
-**Fix**: use `x = x + 1` (creates a new tensor) instead of `x += 1` (modifies in place).
-
-```python
-x = torch.tensor([1.0], requires_grad=True)
-y = x * 2
-x = x + 1     # creates NEW tensor, original x is untouched
-y.backward()  # works — y's backward still sees the original x.data = 1.0
-```
-
-### Bug 4: Detaching when you should not
-
-```python
-y = model(x).detach()   # disconnects y from the graph
-loss = criterion(y, target)
-loss.backward()          # gradients stop at y — model gets no updates
-```
-
-What `detach()` does: creates a new tensor that shares the same data but has `grad_fn = None` and `requires_grad = False`. The backward pass hits `y` and stops — it sees no graph behind it.
-
-```
-With detach:    loss → criterion → y (detached, no grad_fn) ← backward stops here
-Without detach: loss → criterion → y → model layers → parameters ← backward reaches parameters
-```
-
-Use `detach()` intentionally when you want to stop gradients (e.g., target networks in RL, where you want to compute a loss against a frozen copy). But do not use it accidentally in the middle of a training pipeline.
-
-### Debugging tools
-
-```python
-# Print the backward graph
-print(loss.grad_fn)                    # the last operation
-print(loss.grad_fn.next_functions)     # its inputs
-
-# Check if a tensor requires grad
-print(x.requires_grad)
-
-# Check if a tensor is a leaf
-print(x.is_leaf)
-
-# Detect anomalies (NaN/Inf in gradients)
-with torch.autograd.detect_anomaly():
-    loss.backward()
-```
-
----
-
-## Higher-Order Gradients
-
-PyTorch can differentiate through the backward pass itself — gradients of gradients. Let's trace through a concrete example:
-
-```python
 x = torch.tensor([2.0], requires_grad=True)
-y = x ** 3          # y = x^3 = 8.0
+y = x ** 3
 ```
 
-**First derivative:**
+First derivative:
 
 ```python
 dy_dx = torch.autograd.grad(y, x, create_graph=True)[0]
-# dy/dx = 3x^2 = 3 * 4 = 12.0
+print(dy_dx)  # tensor([12.])
 ```
 
-`torch.autograd.grad` computes the gradient without storing it in `x.grad`. The key is `create_graph=True` — this tells PyTorch: "build a computation graph for the gradient computation itself." Without it, `dy_dx` would be a plain tensor with no graph attached.
+Why `create_graph=True` matters:
 
-With `create_graph=True`, `dy_dx` is a tensor that knows it came from `3 * x * x`. It has its own `grad_fn`.
+1. without it, PyTorch computes the gradient and stops there
+2. with it, PyTorch builds a graph for the gradient computation too
 
-**Second derivative:**
+Second derivative:
 
 ```python
 d2y_dx2 = torch.autograd.grad(dy_dx, x)[0]
-# d^2y/dx^2 = 6x = 6 * 2 = 12.0
-print(d2y_dx2)      # tensor([12.])
+print(d2y_dx2)  # tensor([12.])
 ```
 
-This differentiates `dy_dx = 3x^2` with respect to `x`, giving `6x = 12`. It works because `dy_dx` has a computation graph (thanks to `create_graph=True`), so PyTorch can run backward through it again.
+Math:
 
-```
-Normal backward:
-  y = x^3
-  backward computes: dy/dx = 3x^2    ← result has no graph, cannot differentiate further
-
-create_graph=True backward:
-  y = x^3
-  backward computes: dy/dx = 3x^2    ← result HAS a graph (3 * x * x)
-  second backward:   d^2y/dx^2 = 6x  ← differentiates through the first backward's graph
+```text
+y = x^3
+dy/dx = 3x^2
+d2y/dx2 = 6x
+at x = 2: d2y/dx2 = 12
 ```
 
-This is used in:
+Why our toy engine cannot do this yet:
 
-- **Meta-learning** (MAML) — gradients through the optimization step: you need `d(loss_test) / d(theta_initial)`, which requires differentiating through `theta_updated = theta_initial - lr * grad`
-- **Regularization** — penalizing gradient magnitude: `loss += lambda * grad.norm()` requires the gradient of a gradient
-- **Physics-informed neural networks** — enforcing PDE constraints like `d^2u/dx^2 + d^2u/dy^2 = 0` requires second derivatives
+1. our backward closures do plain Python float math
+2. those float operations do not build a new computation graph
+3. so there is nothing to differentiate through on the second pass
 
-Our engine cannot do this because `_backward` closures use plain Python arithmetic (`float` operations) that do not build a Value graph. To support higher-order gradients, each `_backward` closure would need to create new Value nodes for its own computations — the backward pass would itself be recorded on the tape.
-
-**What would need to change in our engine?** Today, `backward()` does this:
-
-```python
-self.grad = 1.0
-for node in reversed(order):
-    node._backward()   # just Python math — result is a float, not a Value
-```
-
-To support higher-order gradients, `_backward()` would need to **record** its computation as a new Value node, not just do arithmetic:
-
-```python
-# Hypothetical: backward that builds a graph
-def _backward():
-    # Instead of: self.grad += other.data * out.grad  (plain float)
-    # We would do:
-    grad_value = other.data * out.grad    # creates a NEW Value node
-    self.grad_node = self.grad_node + grad_value   # records this op in the tape
-```
-
-Then calling `backward()` on the gradient *itself* would replay *that* tape. The backward pass becomes a forward pass — you need a tape of the backward pass to differentiate through it. PyTorch handles this with `create_graph=True` in `torch.autograd.grad`.
-
-> **Try It Yourself**
-> ```python
-> # First derivative: dy/dx at x = 2.0, y = x^3
-> x = torch.tensor([2.0], requires_grad=True)
-> y = x ** 3
-> dy_dx = torch.autograd.grad(y, x, create_graph=True)[0]
-> print(f"dy/dx = {dy_dx}")        # tensor([12.]) — correct: 3 * 2^2 = 12
->
-> # Second derivative: d^2y/dx^2
-> d2y_dx2 = torch.autograd.grad(dy_dx, x)[0]
-> print(f"d2y/dx2 = {d2y_dx2}")   # tensor([12.]) — correct: 6 * 2 = 12
-> ```
+To support higher-order gradients, the backward pass itself would need to create new `Value` nodes instead of raw floats.
 
 ---
 
-## Memory: Where Autograd Bytes Go
+## Step 9: Understand Memory And Checkpointing
 
-For a model with `N` parameters and `L` layers:
+### Step 9.1: Where autograd memory actually goes
 
-```
-Forward pass stores:
-  - Activations at each layer: O(L * batch_size * hidden_dim)
-  - The computation graph nodes: O(num_operations)
+For real models, memory is usually dominated by saved activations, not by the graph metadata itself.
 
-Backward pass stores:
-  - Gradients: same shape as activations
-  - Parameter gradients: same shape as parameters
+Very rough breakdown:
 
-Peak memory ≈ parameters + activations + gradients
-           ≈ N + 2 * (L * B * H)
-```
-
-For a 1B parameter model with batch size 32 and 32 layers of hidden dim 4096:
-
-```
-Parameters:  ~4 GB  (1B * 4 bytes FP32)
-Activations: ~16 GB (32 layers * 32 batch * 4096 dim * 4 bytes)
-Gradients:   ~16 GB (same as activations)
-Param grads: ~4 GB  (same as parameters)
-Total:       ~40 GB
+```text
+memory during training is roughly:
+    parameters
+  + saved activations
+  + parameter gradients
+  + optimizer state
 ```
 
-This is why gradient checkpointing, mixed precision (FP16 halves activation memory), and activation offloading exist. The autograd graph itself is small — the activations it holds references to are large.
+Why activations matter:
 
----
+1. backward needs certain forward-time values
+2. those values must stay alive until the matching backward rule runs
+3. deep networks therefore keep a lot of intermediate tensors around
 
-## Gradient Checkpointing: Trading Compute for Memory
+Our toy engine hides this because each saved value is just one float.
 
-In a deep network, the forward pass stores activations at every layer for the backward pass. For a 100-layer network, that is 100 sets of activations in memory simultaneously.
+### Step 9.2: Gradient checkpointing
 
-**Gradient checkpointing** drops intermediate activations and recomputes them during backward:
+Checkpointing trades compute for memory.
 
-```
-Normal (high memory):
-  Forward:   L1 → L2 → L3 → L4 → L5 → loss
-  Stored:    [a1] [a2] [a3] [a4] [a5]         ← all in memory
+Normal training:
 
-Checkpointed (low memory):
-  Forward:   L1 → L2 → L3 → L4 → L5 → loss
-  Stored:    [a1]       [a3]       [a5]        ← only checkpoints kept
-  Backward:  recompute a2 from a1, recompute a4 from a3
+```text
+forward: save many intermediate activations
+backward: reuse those saved activations
 ```
 
-Memory drops from O(n) to O(sqrt(n)) layers. The cost: each non-checkpointed layer is computed twice — once in forward, once in backward.
+Checkpointed training:
 
-### Manual checkpointing in our engine
-
-Here is how to manually implement checkpointing on a simple 3-layer computation:
-
-```python
-class CheckpointedLayer:
-    def __init__(self, weight):
-        self.weight = weight
-
-    def forward(self, x):
-        # Non-checkpointed: stores x for backward
-        return x * self.weight
-
-    def backward(self, grad_out):
-        # Gradients flow through stored x
-        return grad_out * self.weight
+```text
+forward: save only selected checkpoints
+backward: recompute missing activations when needed
 ```
 
-With manual checkpointing, you explicitly decide what to save and what to recompute:
+Conceptually:
 
-```python
-# Forward pass — save only checkpoints
-x1 = layer1.forward(x0)         # compute and DISCARD x0
-x2 = layer2.forward(x1)         # compute and DISCARD x1 — save only x2
-x3 = layer3.forward(x2)         # compute and DISCARD x2 — save only x3 (loss input)
+```text
+Normal:
+    x -> a1 -> a2 -> a3 -> a4 -> loss
+    save: a1, a2, a3, a4
 
-# During backward, recompute missing activations from checkpoints
-x2_recomputed = recompute(layer2, x1)  # recreate x1's output from x1 input
-x1_recomputed = recompute(layer1, x0)  # recreate x0's output from x0 input
-
-# Now compute gradients using the recomputed values
-grad_x2 = x3._prev[0].grad           # already computed
-grad_x1 = layer2.backward(grad_x2)   # uses x2_recomputed
-grad_x0 = layer1.backward(grad_x1)   # uses x1_recomputed
+Checkpointed:
+    x -> a1 -> a2 -> a3 -> a4 -> loss
+    save: a1, a4
+    recompute: a2, a3 during backward
 ```
 
-### Step-by-step: Forward and Backward with Checkpointing
+### Step 9.3: What happens step by step
 
-Consider a 3-layer network: `y = W3(W2(W1(x)))`. Here is exactly what happens:
+Suppose:
 
-```
-Forward pass:
-  Step 1: a1 = W1 @ x          — compute and STORE x (checkpoint)
-  Step 2: a2 = W2 @ a1        — compute and DISCARD a1 (checkpoint only a2)
-  Step 3: a3 = W3 @ a2        — compute and DISCARD a2
-  Step 4: loss = loss(a3)    — loss is the final output
-
-Backward pass:
-  Step 1: loss.grad = 1.0
-  Step 2: grad_a3 = d(loss)/d(a3) — known from loss backward
-  Step 3: grad_a2 = W3.T @ grad_a3 — uses stored W3, computes grad to a2
-  Step 4: RECOMPUTE a2 from a1 (saved checkpoint) — forward pass through W2
-  Step 5: grad_a1 = W2.T @ grad_a2 — uses recomputed a2, computes grad to a1
-  Step 6: RECOMPUTE a1 from x  (saved checkpoint) — forward pass through W1
-          grad_x   = W1.T @ grad_a1 — uses recomputed a1
+```text
+y = W3(W2(W1(x)))
 ```
 
-The key insight: you trade **memory** (storing all activations) for **compute** (re-running forward passes during backward). In practice, this means you save activations at layers 1, 3, 5, ... (every sqrt(n) layers) and recompute the rest.
+Checkpointed view:
 
-### In PyTorch:
+1. Forward computes all layers.
+2. Only selected activations are kept.
+3. Backward starts from the loss.
+4. When a missing activation is needed, PyTorch re-runs part of the forward pass to recreate it.
+5. Backward then continues as normal.
+
+### Step 9.4: PyTorch API
 
 ```python
 from torch.utils.checkpoint import checkpoint
 
-# Instead of:  y = self.block(x)
-# Use:         y = checkpoint(self.block, x, use_reentrant=False)
+y = checkpoint(block, x, use_reentrant=False)
 ```
 
-`checkpoint` wraps a function and:
-1. Runs the forward pass, saving only at specified intervals
-2. During backward, recomputes the dropped activations on-the-fly
-3. Returns the same result as the non-checkpointed version
+Use checkpointing when activation memory is the bottleneck and extra compute is acceptable.
 
-`use_reentrant=False` is required for correct gradient handling in modern PyTorch.
+Do not use it blindly:
 
-> **Try It Yourself**
-> ```python
-> # Manually trace checkpointing on a tiny example
-> # Layer 1: y1 = w1 * x
-> # Layer 2: y2 = w2 * y1
-> # Layer 3: y3 = w3 * y2
-> #
-> # Full forward: stores y1, y2, y3 (3 activations)
-> # Checkpointed (save y1, y3 only):
-> #   forward: saves y1, y3; recomputes y2 during backward
-> #   memory saved: 1 activation
-> #   compute cost: +1 recompute per backward
-> ```
+- it makes training slower
+- debugging gets harder
+- some code paths interact badly with side effects or mutation
 
-Our tiny engine has no memory pressure — everything is a single float. But the principle is the same: you can drop intermediate values and recompute them from checkpoints.
+---
+
+## Step 10: Common Ways Autograd Code Breaks
+
+### Bug 1: Replacing `+=` with `=`
+
+Wrong:
+
+```python
+self.grad = other.data * out.grad
+```
+
+Right:
+
+```python
+self.grad += other.data * out.grad
+```
+
+Symptom: gradients look correct on simple chains but fail on reused nodes or branching graphs.
+
+### Bug 2: Forgetting to clear gradients between optimizer steps
+
+```python
+optimizer.zero_grad()
+loss.backward()
+optimizer.step()
+```
+
+Symptom: gradients and parameter updates grow unexpectedly because values accumulate across batches.
+
+### Bug 3: Unsafe in-place operations
+
+```python
+y.add_(1)
+```
+
+Symptom: runtime error about a variable needed for gradient computation being modified in place.
+
+Fix: replace with an out-of-place op such as `y = y + 1` unless you are sure the in-place version is safe.
+
+### Bug 4: Accidental `detach()`
+
+```python
+features = model(x).detach()
+loss = head(features).sum()
+loss.backward()
+```
+
+Symptom: the upstream model stops receiving gradients.
+
+### Bug 5: Expecting `.grad` on non-leaf tensors
+
+```python
+print(y.grad)  # often None
+```
+
+Fix: call `y.retain_grad()` before backward if you need to inspect it.
+
+### Debug checklist
+
+When gradients look wrong, inspect these first:
+
+1. `tensor.requires_grad`
+2. `tensor.is_leaf`
+3. `tensor.grad_fn`
+4. whether you called `zero_grad()`
+5. whether any `detach()` or `no_grad()` block cuts the graph
+6. whether an in-place op changed a saved tensor
+
+Useful tools:
+
+```python
+print(loss.grad_fn)
+print(loss.grad_fn.next_functions)
+
+with torch.autograd.detect_anomaly():
+    loss.backward()
+```
 
 ---
 
 ## Quick Reference
 
 ```python
-# ============================================================
-# PyTorch autograd essentials
-# ============================================================
-
 # Compute gradients
-loss.backward()                          # populates .grad on all leaves
-torch.autograd.grad(loss, [x, y])        # returns gradients without populating .grad
+loss.backward()
+grads = torch.autograd.grad(loss, [x, y])
 
 # Higher-order gradients
-g = torch.autograd.grad(y, x, create_graph=True)[0]
-g2 = torch.autograd.grad(g, x)[0]       # second derivative
-
-# Disable gradient tracking
-with torch.no_grad(): ...               # no graph, still allows version checks
-with torch.inference_mode(): ...         # no graph, no version checks (fastest)
-x.detach()                               # new tensor, no grad_fn
-
-# Inspect the graph
-loss.grad_fn                             # last operation
-loss.grad_fn.next_functions              # inputs to last operation
-x.requires_grad                          # does this tensor track gradients?
-x.is_leaf                                # is this a leaf tensor?
+g1 = torch.autograd.grad(loss, x, create_graph=True)[0]
+g2 = torch.autograd.grad(g1, x)[0]
 
 # Hooks
-x.register_hook(lambda g: print(g))      # fires when x.grad is computed
-module.register_full_backward_hook(fn)   # fires when gradients flow through module
+x.register_hook(lambda grad: print(grad))
+handle = module.register_full_backward_hook(hook_fn)
 
-# Keep gradients on non-leaf tensors
+# Non-leaf gradients
 y.retain_grad()
 
-# Detect NaN/Inf in gradients
-with torch.autograd.detect_anomaly():
-    loss.backward()
+# Disable graph building
+with torch.no_grad():
+    out = model(x)
 
-# Gradient checkpointing
+with torch.inference_mode():
+    out = model(x)
+
+# Checkpointing
 from torch.utils.checkpoint import checkpoint
-y = checkpoint(block, x, use_reentrant=False)
-
-# Clear gradients between training steps
-optimizer.zero_grad()
+out = checkpoint(block, x, use_reentrant=False)
 ```
 
 ---
 
 ## Takeaways
 
-- **Scalar autograd and tensor autograd are the same algorithm.** The only difference is VJPs (vector-Jacobian products) instead of scalar derivatives.
-- **`+=` is not optional.** Multi-use nodes require gradient accumulation from all paths.
-- **Hooks let you intercept, log, and modify gradients mid-flight.** Use them for debugging and gradient clipping.
-- **Custom Functions define forward and backward explicitly.** Use them when PyTorch does not know how to differentiate your operation.
-- **Gradient checkpointing trades compute for memory.** O(sqrt(n)) memory instead of O(n).
-- **`no_grad()` and `inference_mode()` skip graph construction.** Always use them during inference.
-- **In-place operations break the graph.** Prefer out-of-place operations in differentiable code.
-- **Memory cost is dominated by activations, not the graph itself.** Reducing activation memory (checkpointing, mixed precision, offloading) is where the wins are.
+1. PyTorch autograd is the same idea as our toy engine: record forward structure, then run local backward rules in reverse.
+2. The tensor version uses vector-Jacobian products instead of scalar derivatives.
+3. Gradient accumulation with `+=` is mandatory whenever a node can influence the output through multiple paths.
+4. PyTorch keeps leaf gradients by default and drops most intermediate gradients to save memory.
+5. Hooks, custom `Function`s, and checkpointing are extensions of the same basic graph-and-backward model.
+6. Most autograd bugs come from overwritten gradients, stale grads, in-place mutation, or accidentally breaking the graph.
 
-Sources:
-- https://pytorch.org/docs/stable/autograd.html
-- https://pytorch.org/docs/stable/notes/autograd.html
-- https://pytorch.org/tutorials/beginner/blitz/autograd_tutorial.html
+---
+
+## Official References
+
+- PyTorch autograd docs: https://docs.pytorch.org/docs/stable/autograd.html
+- Autograd mechanics note: https://docs.pytorch.org/docs/stable/notes/autograd.html
+- Beginner autograd tutorial: https://docs.pytorch.org/tutorials/beginner/blitz/autograd_tutorial.html
+- Activation checkpointing docs: https://docs.pytorch.org/docs/stable/checkpoint.html

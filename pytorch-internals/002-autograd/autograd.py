@@ -80,7 +80,7 @@ class Value:
 
     def backward(self):
         """Topologically sort the graph and replay the tape."""
-        # Reset gradients so we can call backward() multiple times cleanly.
+        # Gradients accumulate across backward() calls because _backward uses +=.
         visited = set()
         order = []
 
@@ -106,33 +106,6 @@ class Value:
         else:
             grad_str = f"{self.grad:.6f}"
         return f"Value({self._label}, data={self.data:.4f}, grad={grad_str})"
-
-
-# ------------------------------------------------------------------
-# GradientTape — context manager that records every Value created
-# ------------------------------------------------------------------
-
-class GradientTape:
-    """Records every Value created inside the block.
-
-    Usage:
-        with GradientTape() as tape:
-            a = Value(2.0, label="a")
-            b = a * a
-        print(tape.history)   # list of (label, op, input_labels)
-    """
-
-    def __init__(self):
-        self.history = []
-        self._orig_id = Value._id
-
-    def __enter__(self):
-        self._orig_id = Value._id
-        return self
-
-    def __exit__(self, *args):
-        # Nothing to clean up — Value objects are long-lived.
-        pass
 
 
 # ------------------------------------------------------------------

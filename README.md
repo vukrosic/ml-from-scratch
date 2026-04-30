@@ -24,7 +24,7 @@ More tutorials coming soon.
 Every tutorial folder contains:
 
 - **README.md** -- the core article explaining the concept step by step, with small code blocks and concrete examples
-- **Python files** -- runnable implementations you can execute immediately (`python autograd.py`)
+- **Python files** -- runnable implementations you can execute immediately (`python3 autograd.py`)
 - **ADVANCED.md** -- deeper coverage: benchmarks, profiling, PyTorch internals, edge cases, and debugging techniques
 
 The README teaches the concept. The Python files let you run it. ADVANCED goes deeper for those who want the full picture.
@@ -38,9 +38,9 @@ cd ml-from-scratch
 
 # Pick a tutorial and run it
 cd pytorch-internals/002-autograd
-python autograd.py          # run the from-scratch implementation
-python compare.py           # verify against PyTorch
-python visualize.py         # see the computation graph
+python3 autograd.py         # run the from-scratch implementation
+python3 compare.py          # verify against PyTorch
+python3 visualize.py        # see the computation graph
 ```
 
 Each tutorial is self-contained. No cross-dependencies between lessons. You need Python 3.8+ and PyTorch for the comparison scripts.
